@@ -10,6 +10,10 @@
 - 单独生成用户场景标签和反馈分类标签（ground truth），不混入业务数据表，避免 Agent 直接读取答案。
 - 执行数据质量检查。
 - 将 CSV 数据导入 SQLite。
+- 已实现只读 SQL 查询工具。
+- 已实现用户激活漏斗分析工具。
+- 已实现精确日期用户留存分析工具。
+- 已实现 DAU、滚动 WAU 和滚动 MAU 用户活跃分析工具。
 
 > 所有数据均为合成数据，不代表任何真实公司或真实用户。反馈文本为虚构的产品体验描述，不包含真实家庭成员、儿童语音、视频或聊天内容。
 
@@ -82,11 +86,97 @@ python -m src.data.load_sqlite
 
 ## 重要设计约定
 
+### 三个业务工具统一口径（质量完善）
+
+所有指标按 UTC 计算；cohort/趋势起止日期包含当天。默认完整数据覆盖声明为 2026-08-16 至 2026-11-13，来自 settings.yaml 的 dataset_end_date 和 default_days；这一声明不能自动证明区间内没有采集中断。
+
+| 工具 | 有效依据 | 时间窗口和限制 |
+|---|---|---|
+| 激活 | devices.bound_at；onboarding_complete；ai_interaction | 默认注册后7天，窗口左闭右开；严格要求 注册 <= 绑定 <= 引导 <= AI；各阶段独立用户去重，只统计完整观察窗口用户 |
+| 留存 | app_open、ai_interaction | Exact-day：UTC注册日期+n日；默认D1/D7/D30共用成熟到D30的用户分母；不是区间留存 |
+| 活跃 | app_open、ai_interaction、feature_use | DAU当天，WAU含当天及前6天，MAU含当天及前29天；历史不足返回None，覆盖外请求报错 |
+
+激活允许相等时间；每步寻找满足前置条件的最早事件，早期乱序事件不阻止后续合法事件完成激活。查询按注册日分批，保持 SQLQueryTool 执行限制。中间结果物化语法需要 SQLite 3.35+。
+
+留存率、激活率以0～1返回；活跃输出人数而非比例。套餐分组使用当前套餐快照，不能还原历史套餐。活跃趋势仅首尾对比，不能证明持续变化或原因。严格顺序可能排除模拟数据中引导早于绑定的用户，不能据此直接断言真实产品引导问题。
+
 1. `user_scenarios.csv` 是评估标签，不应作为 Agent 的业务查询数据源。
 2. `events` 是事件事实表；`devices.current_status` 表示数据集结束时的设备状态。
 3. 留存、激活、功能使用和付费指标应在后续分析模块中统一定义口径。
 4. 所有时间字段使用 ISO 8601 格式，默认按 UTC 存储；本项目的模拟数据不对应真实地域时区。
 5. 不将真实儿童信息、语音、视频、聊天记录或家庭隐私放入项目数据。
+
+## 用户激活漏斗分析
+
+激活定义：用户注册后的观察窗口内，同时完成设备绑定、新手引导和至少一次 AI 交互。默认观察窗口为 7 天，只统计拥有完整观察窗口的注册用户。
+
+漏斗采用累计口径：新手引导阶段只统计已经绑定设备的用户，首次 AI 交互阶段只统计已经完成前两步的用户。日期和时间统一按 UTC 计算，窗口为 `[注册时间, 注册时间 + observation_days)`。
+
+运行示例：
+
+```bash
+python -m src.tools.demo_activation_funnel 2026-08-16 2026-11-06 --observation-days 7
+```
+
+在 Python 中调用：
+
+```python
+from src.analytics.activation import analyze_activation_funnel
+
+result = analyze_activation_funnel("2026-08-16", "2026-11-06", 7)
+```
+
+运行独立单元测试（仅使用 Python 标准库，测试会创建临时数据库，不修改正式数据）：
+
+```bash
+python -m unittest discover -s tests -p "test_activation.py" -v
+```
+
+## 用户留存分析
+
+留存采用 Exact-day Retention：D1、D7、D30 分别表示用户在注册日期后的第 1、7、30 个 UTC 日历日，是否至少发生一次 `app_open` 或 `ai_interaction`。多个指标统一使用已经完整观察到最大请求天数的成熟用户作为分母。
+
+运行总体留存分析：
+
+```bash
+python -m src.tools.demo_retention 2026-08-16 2026-10-14
+```
+
+按获客渠道分组：
+
+```bash
+python -m src.tools.demo_retention 2026-08-16 2026-10-14 --breakdown-by acquisition_channel
+```
+
+也可使用 `--breakdown-by plan_type`，或用 `--data-through-date YYYY-MM-DD` 显式指定可靠的数据截止日期。未指定时读取 `configs/settings.yaml` 的 `dataset_end_date`。
+
+运行独立测试：
+
+```bash
+python -m unittest discover -s tests -p "test_retention.py" -v
+```
+
+## 用户活跃分析
+
+支持关键字参数 `as_of_date`（默认 end_date）、`breakdown_by`（acquisition_channel 或 plan_type）。返回基准日 `dau/wau/mau`、`daily_trend`、分组 `breakdown` 和首尾 DAU 对比 `trend_analysis`。套餐取当前 users.plan_type，不代表历史套餐。首尾对比不能证明持续趋势或业务原因。
+
+无参数演示：`python -m src.tools.demo_user_activity`，展示配置截止日指标及渠道、套餐分组。日期参数仍可指定趋势区间。
+
+有效活跃事件包括 `app_open`、`ai_interaction` 和 `feature_use`。DAU 是某个 UTC 自然日内的独立活跃用户数；WAU 是截至该日向前 7 个自然日内的独立活跃用户数；MAU 是截至该日向前 30 个自然日内的独立活跃用户数。
+
+事件记录数与活跃用户数会分别返回。同一个用户一天产生多条事件，只增加事件记录数，不会被重复计入 DAU、WAU 或 MAU。
+
+```bash
+python -m src.tools.demo_user_activity 2026-10-15 2026-11-13
+```
+
+数据完整覆盖范围默认根据 `configs/settings.yaml` 中的 `dataset_end_date` 和 `default_days` 计算。请求超出覆盖范围会报错；WAU 或 MAU 的历史窗口不完整时返回 `None`，不会把缺失数据表示为零活跃。
+
+运行独立测试：
+
+```bash
+python -m unittest discover -s tests -p "test_user_activity.py" -v
+```
 
 ## 后续阶段规划
 
