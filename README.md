@@ -178,6 +178,44 @@ python -m src.tools.demo_user_activity 2026-10-15 2026-11-13
 python -m unittest discover -s tests -p "test_user_activity.py" -v
 ```
 
+## 用户反馈趋势分析
+
+`analyze_feedback_trends()` 使用 feedback 和 users，通过现有只读 SQLQueryTool 查询，复用规则版本1.0.0的 `classify_feedback_text()`，不调用大模型API，不读取ground_truth，不将分类标签写入数据库。
+
+```python
+from src.analytics.feedback import analyze_feedback_trends
+
+result = analyze_feedback_trends(
+    "2026-08-16", "2026-11-13",
+    breakdown_by="channel",
+    analysis_mode="rules",
+)
+```
+
+结果包含总量、独立反馈用户数、原文种类、每日数量、主题/情感及状态分布、每日负面数量及占比、前10种高频原文和可选分组。相同文本的不同反馈记录分别计数，用户数按user_id去重，原始文本不做清洗改写。
+
+分组白名单为 `channel`（反馈提交渠道）、`acquisition_channel`（用户获客渠道）、`plan_type`（当前套餐快照，不能还原提交时的历史套餐）。缺少关联用户时保留反馈，用户属性分组值为null并返回警告。
+
+`analysis_mode="none"` 不调用分类器，仅返回原始统计；主题、情感、状态分布、负面趋势和分类计数为None，不能解读为没有负面反馈。`rules`模式单独保留unknown和invalid_input，不将unknown并入neutral。`summary.unknown_category/unknown_sentiment`包括invalid_input带来的unknown标签，`valid_unknown_*`则排除无效输入；两种统计不混淆。
+
+日期按UTC，起止日期包含当天，SQL采用 `[开始日零点, 结束日次日零点)`；默认覆盖来自配置的2026-08-16至2026-11-13。可用 `data_start_date` 和 `data_through_date` 显式声明其他数据覆盖范围，覆盖外请求报错。配置或调用者声明不能证明内部采集无中断。
+
+比例使用0～1小数并保留4位；主题/情感分母为范围内所有反馈（包括unknown与invalid_input），每日负面比例分母为当天所有反馈，分组比例分母为组内反馈。完整覆盖且无反馈的日期数量和负面比例均为0。分类器异常将抛出带反馈ID的FeedbackAnalysisError，不生成成功的部分报告。
+
+默认每页100条，通过唯一feedback_id的游标分页，核对COUNT、ID唯一性、独立用户数、不同文本数及每页truncated。截断、重复ID、缺页或计数变化会报错。SQLQueryTool的各次查询是独立连接，不保证并发修改时的跨页事务快照；正式只读模拟库可正常使用。
+
+演示命令（无参数默认读取配置完整时间范围）：
+
+```powershell
+python -m src.tools.demo_feedback_trends
+python -m src.tools.demo_feedback_trends 2026-11-01 2026-11-13 --breakdown-by acquisition_channel
+python -m src.tools.demo_feedback_trends 2026-08-16 2026-11-13 --breakdown-by plan_type
+python -m src.tools.demo_feedback_trends 2026-08-16 2026-11-13 --analysis-mode none
+python -m unittest discover -s tests -p "test_feedback_trends.py" -v
+```
+
+正式库验证（2026-08-16至2026-11-13）：186条反馈、186位用户、15种文本，负面85、正面52、中性49，unknown与invalid_input均0，歧义标记81。反馈趋势测试29项通过。规则基于少量模板，结果表示文本规则分类，不是独立样本准确率或满意度评分。
+
 ## 后续阶段规划
 
 - 第二阶段：LangGraph 单 Agent，自主规划、工具选择、执行反馈与动态重规划。
