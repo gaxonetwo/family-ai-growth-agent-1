@@ -14,6 +14,8 @@
 - 已实现用户激活漏斗分析工具。
 - 已实现精确日期用户留存分析工具。
 - 已实现 DAU、滚动 WAU 和滚动 MAU 用户活跃分析工具。
+- 已实现反馈主题、情感与负面趋势分析工具。
+- 已实现四个业务工具的统一注册、参数发现、校验和安全执行入口。
 
 > 所有数据均为合成数据，不代表任何真实公司或真实用户。反馈文本为虚构的产品体验描述，不包含真实家庭成员、儿童语音、视频或聊天内容。
 
@@ -215,6 +217,33 @@ python -m unittest discover -s tests -p "test_feedback_trends.py" -v
 ```
 
 正式库验证（2026-08-16至2026-11-13）：186条反馈、186位用户、15种文本，负面85、正面52、中性49，unknown与invalid_input均0，歧义标记81。反馈趋势测试29项通过。规则基于少量模板，结果表示文本规则分类，不是独立样本准确率或满意度评分。
+
+## 单 Agent 工具注册与统一调用
+
+`src/agent/` 提供 Tool Registry、JSON-Schema 风格参数定义、Tool Executor 和稳定结果格式。Registry 仅保存明确注册的四个业务函数，不根据用户输入动态导入或执行 Python 代码；Executor 先验证结构化参数，再调用已注册函数。四个工具均为只读分析工具，Agent Schema 不开放内部 `db_path` 和 `query_runner` 参数。
+
+```python
+from src.agent import ToolExecutor, create_default_tool_registry
+
+registry = create_default_tool_registry()
+print(registry.get_tool_descriptions())
+
+executor = ToolExecutor(registry)
+result = executor.execute(
+    "analyze_user_activity",
+    {"start_date": "2026-11-01", "end_date": "2026-11-13"},
+)
+```
+
+成功和失败均返回包含 `ok`、`tool_name`、`data`、`error`、`metadata.execution_status` 的统一结构。参数缺失、类型或日期错误、多余字段、非法枚举都会在执行前失败，业务函数不会被调用。完整设计、错误代码、四个 Schema 及新增第五个工具的方法见 `docs/agent_tool_system.md`。
+
+专项测试：
+
+```powershell
+python -m unittest discover -s tests -p "test_tool_registry.py" -v
+python -m unittest discover -s tests -p "test_tool_executor.py" -v
+python -m unittest discover -s tests -p "test_result_formatter.py" -v
+```
 
 ## 后续阶段规划
 
