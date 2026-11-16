@@ -73,7 +73,9 @@ class SQLQueryTool:
     def run(self, sql: str) -> dict[str, Any]:
         """Run a read-only query and return rows plus execution metadata."""
         query = self._clean_query(sql)
-        uri = f"file:{self.db_path.as_posix()}?mode=ro"
+        # Path.as_uri() produces a valid file URI on both Windows and POSIX
+        # and safely escapes spaces or other special path characters.
+        uri = f"{self.db_path.as_uri()}?mode=ro"
 
         conn = sqlite3.connect(uri, uri=True, timeout=self.timeout_seconds)
         conn.row_factory = sqlite3.Row
