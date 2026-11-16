@@ -209,23 +209,45 @@ print(result["status"], result["observations"], result["combined_explanation"])
 
 ## 11. 项目目录结构
 
-```text
+\`\`\`text
 family-ai-growth-agent-1/
-├── configs/                  # 数据截止日期和路径配置
-├── data/                     # 本地合成CSV、SQLite、离线ground_truth（Git忽略）
-├── database/schema.sql       # SQLite表结构
-├── docs/                     # 架构、Agent循环、工具系统和业务规则文档
-├── scripts/run_phase1.py     # 合成数据流水线
+├── configs/
+│   └── settings.yaml                 # 数据截止日期、路径等项目配置
+├── data/
+│   ├── raw/                          # 本地原始合成业务CSV（运行数据不提交）
+│   ├── processed/                    # 本地处理数据及family_ai.db（运行数据不提交）
+│   └── ground_truth/                 # 离线评估数据，不向Agent开放
+├── database/
+│   └── schema.sql                    # SQLite表结构和索引定义
+├── docs/                             # 架构、Agent循环、工具系统和业务规则
+├── reports/                          # 分析报告输出位置
+├── scripts/
+│   └── run_phase1.py                 # 合成数据生成、校验和导入流水线
 ├── src/
-│   ├── agent/                # AgentController、Provider、日期、校验、执行与报告
-│   ├── analytics/            # 四个业务分析工具
-│   ├── data/                 # 数据生成、校验、导入和反馈规则分类器
-│   └── tools/                # SQL工具及命令行演示
-├── tests/                    # 单元、集成和离线端到端测试
-├── AGENTS.md
-├── DEVELOPMENT_LOG.md
-└── requirements.txt
-```
+│   ├── agent/                        # Agent控制、工具管理、参数处理和报告验证
+│   │   └── intent/                   # 意图识别、Provider、日期解析和参数来源核验
+│   ├── analytics/                    # 四类业务指标计算
+│   ├── data/                         # 数据生成、质量检查、导入和反馈分类
+│   │   └── feedback_classifier/      # 反馈文本标准化、主题和情感规则分类
+│   ├── tools/                        # SQL只读查询工具及命令行演示入口
+│   └── ui/                           # 界面模块预留位置，当前尚未实现可用界面
+├── tests/                            # 单元、集成和离线端到端测试
+├── AGENTS.md                         # Codex开发规范
+├── DEVELOPMENT_LOG.md                # 项目阶段记录
+├── PROJECT_STRUCTURE.md              # 完整目录结构及模块职责
+└── requirements.txt                  # Python依赖
+\`\`\`
+
+**主要模块分工：**
+
+- \`src/agent/\`：负责Agent决策循环、工具注册与执行、日期和参数处理、澄清恢复以及报告证据验证。
+- \`src/analytics/\`：负责激活、留存、活跃和反馈四类业务指标的实际计算。
+- \`src/tools/\`：提供SQLite只读查询工具和命令行演示入口，不是四个业务分析函数的存放位置。
+- \`src/data/\`：负责合成数据生成、数据质量检查、SQLite导入及反馈规则分类。
+- \`tests/\`：覆盖业务工具、意图识别、工具安全、Agent状态和多工具报告。
+- \`docs/\`：记录系统架构、Agent执行循环、工具系统和业务分类规则。
+
+仓库中的 \`data/raw/\`、\`data/processed/\`、\`data/ground_truth/\` 和 \`reports/\` 当前保留目录占位文件；本地运行数据可能被Git忽略，不会全部显示在GitHub上。完整目录说明见 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。
 
 ## 12. 当前限制
 
