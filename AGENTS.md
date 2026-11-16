@@ -55,7 +55,6 @@ family-ai-growth-agent-1/
 ├── database/
 │   └── schema.sql                    # SQLite表结构和索引定义
 ├── docs/                             # 架构、Agent循环、工具系统及业务规则文档
-├── reports/                          # 分析报告输出位置
 ├── scripts/
 │   └── run_phase1.py                 # 合成数据生成、校验和导入流水线
 ├── src/
@@ -65,7 +64,6 @@ family-ai-growth-agent-1/
 │   ├── data/
 │   │   └── feedback_classifier/      # 反馈文本标准化、主题和情感规则分类
 │   ├── tools/                        # SQL只读查询工具和命令行演示入口
-│   └── ui/                           # 界面模块预留；当前未实现可用界面
 ├── tests/                            # 单元、集成和离线端到端测试
 ├── .env.example                      # 环境变量模板，不包含真实密钥
 ├── AGENTS.md                         # Codex开发规范
@@ -75,7 +73,7 @@ family-ai-growth-agent-1/
 └── requirements.txt                  # Python依赖
 \`\`\`
 
-仓库中的 \`data/raw/\`、\`data/processed/\`、\`data/ground_truth/\` 和 \`reports/\` 当前保留目录占位文件；本地运行数据按 Git 忽略规则管理。GitHub 页面未显示本地数据文件，不代表本地运行环境中不存在。
+仓库中的 \`data/raw/\`、\`data/processed/\` 和 \`data/ground_truth/\` 当前保留目录占位文件；本地运行数据按 Git 忽略规则管理。GitHub 页面未显示本地数据文件，不代表本地运行环境中不存在。
 
 ## 5. 业务数据与安全边界
 
