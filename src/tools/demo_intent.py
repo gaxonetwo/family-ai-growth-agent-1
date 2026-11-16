@@ -12,6 +12,8 @@ from src.agent.intent.intent_parser import IntentParserConfigurationError
 from src.agent.intent.mock_provider import MockIntentProvider
 from src.agent.intent.models import IntentCandidate, IntentStatus, ProviderResponse
 from src.agent.intent.provider import IntentProviderError
+from src.agent.single_tool_execution import SingleToolExecution
+from src.agent.tool_executor import ToolExecutor
 
 
 _PROVIDER_ERROR_MESSAGES = {
@@ -109,7 +111,8 @@ def run_session(pipeline, *, input_fn=None, output_fn=None, reference_date=None)
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="意图识别演示：默认Mock，--live使用DeepSeek；不执行业务工具")
+    parser = argparse.ArgumentParser(description="意图识别演示：--live使用DeepSeek，--execute显式执行单个只读工具")
+    parser.add_argument("--execute", action="store_true", help="仅对最终验证通过的任务执行一次业务工具")
     parser.add_argument("--live", action="store_true", help="显式启用DeepSeek；输入有效业务问题后才发送请求")
     parser.add_argument("--intent", choices=[i.value for i in IntentCandidate], default="activity_analysis")
     parser.add_argument("--scenario", choices=["ready", "clarification", "unresolved"], default="ready")
@@ -121,7 +124,7 @@ def main(argv=None):
     else:
         print("离线Mock意图：意图由--intent预设，日期表达固定为最近7天；模型不访问网络。")
         print("输入示例：分析最近7天的活跃情况。澄清场景：按照套餐分析最近7天活跃情况。")
-    print("本演示仅识别与验证，不执行业务工具。")
+    print("执行模式：验证通过后将调用真实只读业务工具。" if args.execute else "仅识别与验证，尚未执行业务工具（需--execute）。")
     environ = dict(os.environ)
     if args.confidence_threshold is not None:
         environ["INTENT_CONFIDENCE_THRESHOLD"] = args.confidence_threshold
@@ -129,6 +132,16 @@ def main(argv=None):
         provider = DeepSeekProvider(environ=environ) if args.live else create_demo_provider(args.intent, args.scenario)
         pipeline = IntentPipeline(provider, environ=environ)
         current = run_session(pipeline, reference_date=args.reference_date)
+        if args.execute and current is not None:
+            bridge = SingleToolExecution(ToolExecutor(pipeline.matcher.registry))
+            execution = bridge.execute(current)
+            print("工具执行状态：" + execution["execution_status"])
+            if execution["tool_result"] is not None:
+                print("业务工具返回：" + json.dumps(execution["tool_result"], ensure_ascii=False, indent=2))
+            elif execution["error"]:
+                print("未执行原因：" + execution["error"]["message"])
+            if not execution["ok"]:
+                return 1
     except IntentProviderError as exc:
         display_provider_error(exc)
         return 2
