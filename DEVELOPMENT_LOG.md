@@ -1,5 +1,11 @@
 # Development Log
 
+## 2026-11-16 — 阶段4.5.1单Agent基础执行循环
+
+新增AgentController，模型按任务与真实观察逐轮选择call_tool、clarify或finish；工具顺序不固定。复用Registry、Schema和ToolExecutor，每次仅执行一个只读工具，限制最大调用次数，失败时保留真实错误并停止。默认返回原始观察，可显式复用ResultExplainer逐工具解释，不提供跨工具综合报告。
+
+DeepSeekProvider新增generate_action并共用既有安全JSON传输；MockActionProvider复用原Mock机制，不访问网络。新增独立专项测试与使用文档，README补充入口。没有修改业务工具、Schema、CSV或数据库，没有读取ground_truth；本批次不新增CLI、复杂规划、长期记忆或多Agent。
+
 ## 2026-11-15 — 阶段3.1反馈趋势分析工具
 
 新增src/analytics/feedback.py、src/tools/demo_feedback_trends.py、tests/test_feedback_trends.py；README补充接口和统计口径。复用既有规则分类器1.0.0，分类规则和前三个业务工具不变。

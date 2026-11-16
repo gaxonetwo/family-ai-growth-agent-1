@@ -245,6 +245,18 @@ python -m unittest discover -s tests -p "test_tool_executor.py" -v
 python -m unittest discover -s tests -p "test_result_formatter.py" -v
 ```
 
+## 单 Agent 基础执行循环（阶段4.5.1）
+
+`src/agent/agent_controller.py` 新增 `AgentController`：每轮由模型根据原始任务、当前工具说明和真实观察选择调用一个工具、请求澄清或结束。允许连续调用不同工具，不写死业务工具顺序。
+
+执行前复用Registry白名单与现有Tool Schema，经ToolExecutor调用只读工具；默认最多4次调用，失败即停止并保留错误。返回真实观察，可显式启用ResultExplainer逐工具解释；尚无跨工具综合报告。
+
+`src/agent/action_provider.py` 提供离线Mock接口，DeepSeekProvider新增独立的`generate_action()`并复用安全传输。未新增自动Live或正式数据库调用入口。使用方法和离线双工具示例见[基础循环说明](docs/basic_agent_loop.md)。
+
+```powershell
+python -m unittest discover -s tests -p "test_agent_controller.py" -v
+```
+
 ## 后续阶段规划
 
 - 第二阶段：LangGraph 单 Agent，自主规划、工具选择、执行反馈与动态重规划。

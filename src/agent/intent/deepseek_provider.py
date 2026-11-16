@@ -201,6 +201,10 @@ class DeepSeekProvider(IntentModelProvider):
         """Independent report interface sharing only JSON transport and safety."""
         return self._generate_json(system_prompt, user_input)
 
+    def generate_action(self, system_prompt: str, user_input: str) -> dict[str, Any]:
+        """Choose one loop action using the existing safe JSON transport."""
+        return self._generate_json(system_prompt, user_input)
+
     def _generate_json(self, system_prompt: str, user_input: str) -> dict[str, Any]:
         if not isinstance(system_prompt, str) or not system_prompt.strip():
             raise IntentProviderError(
