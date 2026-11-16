@@ -7,3 +7,4 @@ data/raw/*.csv
 data/ground_truth/*.csv
 reports/*
 !.gitkeep
+!reports/README.md
