@@ -5,6 +5,4 @@ __pycache__/
 data/processed/*.db
 data/raw/*.csv
 data/ground_truth/*.csv
-reports/*
 !.gitkeep
-!reports/README.md
