@@ -26,7 +26,7 @@
 {"action":"finish"}
 ```
 
-模型每次只能返回一种动作，不能增加任意字段。finish表示选择停止，不表示业务问题已经被独立验证解决；没有工具调用时观察为空，不生成虚构业务结论。
+模型每次只能返回一种动作，不能增加任意字段。阶段4.5.2额外允许call_tool携带`date_expression`，三种动作均可携带`remaining_tasks`。其余字段仍拒绝。finish表示选择停止，不表示业务问题已经被独立验证解决；没有工具调用时观察为空，不生成虚构业务结论。
 
 ## 可运行的离线示例
 
@@ -68,7 +68,7 @@ DeepSeekProvider新增`generate_action()`，共用原有JSON请求、环境配�
 
 控制器默认使用四工具Registry；注入空Registry不会悄悄替换。注入Executor必须使用同一Registry。每次调用检查注册状态与只读标记，复用`schema.validate()`补齐默认值，并检查日期起止顺序；Executor会再次校验并执行注册函数。未注册函数、任意SQL、额外内部参数不会被执行。
 
-返回包含`ok`、`status`、`user_input`、`tool_calls`、`observations`、`decisions`、`explanations`、`clarification_question`、`error`。每条观察保留call_index、工具名、最终参数、Executor完整结果信封，数据和错误不会被模型改写。运行状态在每次run局部创建，返回深拷贝。
+返回包含`ok`、`status`、`user_input`、`tool_calls`、`observations`、`decisions`、`explanations`、`clarification_question`、`error`；阶段4.5.2增加`task_context`与`parameter_checks`。每条观察保留call_index、工具名、最终参数、Executor完整结果信封，数据和错误不会被模型改写。运行状态在每次run局部创建，返回深拷贝。
 
 - completed：模型主动结束；ok=True表示循环正常结束，不保证任务分析完整。
 - needs_clarification：模型询问或参数校验失败；返回中文问题，外部调用方负责接收回答。
@@ -83,10 +83,58 @@ max_tool_calls默认4，允许1至20。达到上限仍允许一次决策来结�
 
 ## 当前限制与验证
 
-参数校验只保证Schema约束合法，不证明模型提取完全符合用户原意。本批次没有重复实现IntentPipeline日期转换、完整参数证据机制或澄清后的会话恢复；缺少绝对日期时应请求澄清。没有复杂反思、长期记忆、任务调度或多Agent，也不保证并发修改Registry的原子性。
+参数校验只保证Schema约束合法，不证明所有模型参数完全符合用户原意。阶段4.5.2已接入现有DateResolver，日期依据和参数冲突可以追踪；尚未移植完整参数证据机制或澄清后的会话恢复。没有复杂反思、长期记忆、任务调度或多Agent，也不保证并发修改Registry的原子性。
+
+## 阶段4.5.2：上下文和参数可靠性
+
+`run(user_input, reference_date=None)`保留原有调用方式，并支持显式参考日；构造函数允许注入`date_resolver=DateResolver(settings_path)`供独立测试使用。参考日优先调用方，其次配置中的dataset_end_date。两者均无效时请求澄清，不使用电脑当天日期。
+
+每轮请求都包含完整原文、完整真实观察、成功执行的工具调用摘要、待办提示和调用次数余额。原文不会被上一轮输出替换。可选`remaining_tasks`仅接受原文中的非空片段；它是模型的进度提示，不是语义完成证明。未提供时保留之前的提示，初始值为完整请求，completion_verified始终为false。
+
+`src/agent/action_parameters.py`衔接DateResolver和真实Schema：
+
+1. 验证显式date_expression确实出现在原文中；没有该字段时，唯一的“最近7天”“最近30天”“本月”“上个月”“今年”表达可以自动定位。
+2. 原文存在多个时间范围时，请求模型明确选择原文片段；无法选择则停止并澄清。
+3. 复用DateResolver处理相对日期或ISO范围，复用其工具字段映射，并与当前Schema的字段核对。
+4. 合并模型参数与本地日期结果，值不同时保留双方并澄清，不静默覆盖。
+5. 调用真实schema.validate()补齐默认值，检查日期顺序，再交Executor执行。
+
+绝对ISO范围可以通过`date_expression`选择，也可兼容旧动作的显式日期参数。未提供日期表达时，不会仅因为任务某处出现ISO日期，就自动替空动作填写范围；旧动作缺少必要参数仍请求澄清。旧格式的直接日期参数尚未进行完整原文语义核验。
+
+IntentValidator绑定意图候选、模型置信度与证据契约，动作协议不具备全部信息，因此不伪造模型置信度来调用它。衔接模块只构造供DateResolver使用的现有IntentDraft与ToolMatchResult；其中confidence=0.0明确为不参与计算的适配占位，不代表模型评分，也不通过它绕过置信度验证。参数约束仍来自同一Registry Schema，没有复制四套业务参数。
+
+相对日期动作示例：
+
+```json
+{"action":"call_tool","tool_name":"analyze_user_activity","arguments":{},"date_expression":"最近7天","remaining_tasks":["再分析上个月留存"]}
+```
+
+上述待办片段必须存在于真实用户原文。参考日2026-11-13时，本地得到start_date=2026-11-07、end_date=2026-11-13；若工具是留存或激活，则得到cohort_start、cohort_end。
+
+复用上方离线示例的假工具Registry，可运行：
+
+```python
+actions = [
+    {"action": "call_tool", "tool_name": "analyze_user_activity",
+     "arguments": {}, "date_expression": "最近7天", "remaining_tasks": ["再分析上个月留存"]},
+    {"action": "call_tool", "tool_name": "analyze_retention",
+     "arguments": {}, "date_expression": "上个月", "remaining_tasks": []},
+    {"action": "finish"},
+]
+provider = MockActionProvider(response_factory=lambda p, c, n: {
+    "output": actions[n - 1], "model": "offline-demo", "finish_reason": "stop"
+})
+result = AgentController(provider, registry).run(
+    "先分析最近7天活跃，再分析上个月留存", reference_date="2026-11-13"
+)
+print([(o["tool_name"], o["arguments"]) for o in result["observations"]])
+```
+
+parameter_checks保留原始动作参数、原文日期片段、DateResolver的参考日及来源、最终参数和冲突明细。日期能解析不代表数据库覆盖完整；例如“今年”可能超出模拟数据期，业务工具仍按原有覆盖规则拒绝执行。当前不处理任意自然语言、否定语境或复杂时间范围归属；不确定时需要澄清。没有增加澄清恢复或跨工具报告。
 
 ```powershell
 python -m unittest discover -s tests -p "test_agent_controller.py" -v
+python -m unittest discover -s tests -p "test_agent_context.py" -v
 python -m pytest -q
 git diff --check
 ```

@@ -253,8 +253,11 @@ python -m unittest discover -s tests -p "test_result_formatter.py" -v
 
 `src/agent/action_provider.py` 提供离线Mock接口，DeepSeekProvider新增独立的`generate_action()`并复用安全传输。未新增自动Live或正式数据库调用入口。使用方法和离线双工具示例见[基础循环说明](docs/basic_agent_loop.md)。
 
+阶段4.5.2增加每轮原文及任务上下文保留、日期和参数检查轨迹。`run(user_input, reference_date=None)`复用DateResolver处理相对日期及ISO范围，参考日优先显式值，其次配置数据截止日期。日期字段按工具映射并核对真实Schema，模型日期与本地结果冲突时停止澄清，不静默覆盖。尚未实现澄清恢复或多工具综合报告。
+
 ```powershell
 python -m unittest discover -s tests -p "test_agent_controller.py" -v
+python -m unittest discover -s tests -p "test_agent_context.py" -v
 ```
 
 ## 后续阶段规划

@@ -1,5 +1,13 @@
 # Development Log
 
+## 2026-11-16 — 阶段4.5.2上下文与参数可靠性
+
+AgentController每轮保留完整原文、真实观察及原文待办提示；待办不作为已验证完成状态。新增action_parameters衔接模块，复用DateResolver和Registry Schema处理日期、参数默认值、字段映射与冲突；调用方reference_date优先于配置，无电脑当前日期兜底。保留旧动作格式与历史测试，新增独立上下文/参数专项测试。
+
+未修改四个业务工具、Schema、Provider、正式数据库或CSV；不开发澄清恢复、综合报告或持久化。开发完成后按要求等待验收，验收通过后独立提交并Push。
+
+验证：开发前365项通过；新增上下文与参数专项27/27、原循环专项25/25，最终完整回归392项通过（288个子测试）。语法、git diff --check及文档离线示例通过。临时配置测试首次受Windows沙箱权限影响，沙箱外重跑通过；保留原有numexpr版本警告，未升级依赖。
+
 ## 2026-11-16 — 阶段4.5.1单Agent基础执行循环
 
 新增AgentController，模型按任务与真实观察逐轮选择call_tool、clarify或finish；工具顺序不固定。复用Registry、Schema和ToolExecutor，每次仅执行一个只读工具，限制最大调用次数，失败时保留真实错误并停止。默认返回原始观察，可显式复用ResultExplainer逐工具解释，不提供跨工具综合报告。
