@@ -79,6 +79,27 @@ class AgentContextTests(unittest.TestCase):
                 args = execute.call_args.args[1]
                 self.assertEqual((args["start_date"], args["end_date"]), (start, end))
 
+    def test_model_relative_date_placeholders_use_local_resolution(self):
+        for expression, start, end in (
+            ("最近7天", "2026-11-07", "2026-11-13"),
+            ("最近30天", "2026-10-15", "2026-11-13"),
+            ("上个月", "2026-10-01", "2026-10-31"),
+        ):
+            with self.subTest(expression=expression):
+                action = call(arguments={"start_date": expression,
+                                         "end_date": expression},
+                              date_expression=expression)
+                result, _, execute = self.run_action(
+                    "分析" + expression + "活跃", action=action)
+                self.assertEqual(result["status"], "completed")
+                arguments = execute.call_args.args[1]
+                self.assertEqual((arguments["start_date"], arguments["end_date"]),
+                                 (start, end))
+                self.assertEqual(
+                    result["parameter_checks"][0]["normalized_date_placeholders"],
+                    ["start_date", "end_date"],
+                )
+
     def test_four_tools_use_their_actual_date_fields(self):
         for tool in self.functions:
             with self.subTest(tool=tool):
@@ -89,6 +110,25 @@ class AgentContextTests(unittest.TestCase):
                 self.assertEqual((args[expected[0]], args[expected[1]]), ("2026-11-07", "2026-11-13"))
                 opposite = ("start_date", "end_date") if expected[0] == "cohort_start" else ("cohort_start", "cohort_end")
                 self.assertTrue(all(key not in args for key in opposite))
+
+    def test_relative_placeholders_keep_four_tool_date_field_mapping(self):
+        for tool in self.functions:
+            with self.subTest(tool=tool):
+                fields = (("cohort_start", "cohort_end")
+                          if tool in (RETENTION, "analyze_activation_funnel")
+                          else ("start_date", "end_date"))
+                action = call(tool, {fields[0]: "最近7天", fields[1]: "最近7天"},
+                              date_expression="最近7天")
+                result, _, execute = self.run_action(
+                    "分析最近7天业务表现", action=action)
+                self.assertEqual(result["status"], "completed")
+                arguments = execute.call_args.args[1]
+                self.assertEqual((arguments[fields[0]], arguments[fields[1]]),
+                                 ("2026-11-07", "2026-11-13"))
+                self.assertEqual(
+                    result["parameter_checks"][0]["normalized_date_placeholders"],
+                    list(fields),
+                )
 
     def test_explicit_reference_overrides_configuration(self):
         _, _, execute = self.run_action(reference_date="2026-12-01")
@@ -132,13 +172,41 @@ class AgentContextTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "unverified_date_expression")
         execute.assert_not_called()
 
-    def test_relative_dates_cannot_silently_override_model_arguments(self):
-        action = call(arguments={"start_date": "2020-01-01", "end_date": "2020-01-07"})
+    def test_relative_placeholders_without_original_evidence_are_rejected(self):
+        action = call(arguments={"start_date": "最近7天", "end_date": "最近7天"},
+                      date_expression="最近7天")
+        result, _, execute = self.run_action("分析活跃", action=action)
+        self.assertEqual(result["error"]["code"], "unverified_date_expression")
+        execute.assert_not_called()
+
+    def test_partial_relative_placeholder_pair_is_rejected(self):
+        action = call(arguments={"start_date": "最近7天"},
+                      date_expression="最近7天")
+        result, _, execute = self.run_action("分析最近7天活跃", action=action)
+        self.assertEqual(result["error"]["code"], "incomplete_date_arguments")
+        execute.assert_not_called()
+
+    def test_model_derived_iso_dates_do_not_override_verified_relative_date(self):
+        action = call(arguments={"start_date": "2026-11-06", "end_date": "2026-11-13"})
         before = deepcopy(action)
         result, _, execute = self.run_action(action=action)
+        self.assertEqual(result["status"], "completed")
+        arguments = execute.call_args.args[1]
+        self.assertEqual((arguments["start_date"], arguments["end_date"]),
+                         ("2026-11-07", "2026-11-13"))
+        self.assertEqual(
+            result["parameter_checks"][0]["normalized_model_date_fields"],
+            ["start_date", "end_date"],
+        )
+        self.assertEqual(action, before)
+
+    def test_user_explicit_iso_conflict_still_stops_before_executor(self):
+        action = call(arguments={"start_date": "2026-10-01", "end_date": "2026-10-07"},
+                      date_expression="最近7天")
+        text = "分析最近7天活跃，用户明确提供的日期是2026-10-01至2026-10-07"
+        result, _, execute = self.run_action(text, action=action)
         self.assertEqual(result["error"]["code"], "date_argument_conflict")
         self.assertEqual(len(result["parameter_checks"][0]["conflicts"]), 2)
-        self.assertEqual(action, before)
         execute.assert_not_called()
 
     def test_matching_model_dates_do_not_conflict(self):
@@ -160,7 +228,8 @@ class AgentContextTests(unittest.TestCase):
         second = json.loads(provider.calls[1]["user_input"])
         self.assertEqual(second["task_context"]["pending_tasks"], ["再分析上个月留存"])
         self.assertEqual(second["task_context"]["completed_calls"][0]["tool_name"], ACTIVITY)
-        self.assertFalse(result["task_context"]["completion_verified"])
+        self.assertEqual(result["task_context"]["pending_tasks"], [])
+        self.assertTrue(result["task_context"]["completion_verified"])
         self.assertEqual(self.functions[RETENTION].call_args.kwargs["cohort_start"], "2026-10-01")
 
     def test_multiple_ranges_need_explicit_original_span(self):

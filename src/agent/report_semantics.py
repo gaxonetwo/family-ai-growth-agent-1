@@ -1,7 +1,7 @@
 """Conservative, local report contract. Unknown prose is not semantic proof.
 
 The model selects facts and follow-up questions; it cannot invent metric labels,
-formulas or conclusions. Only two claim templates are supported in this batch.
+formulas or conclusions. Claim templates remain deliberately narrow.
 """
 import json
 import math
@@ -79,6 +79,32 @@ def report_context(tool_name, data):
                 allowed_suggestions=list(SUGGESTIONS))
 
 
+def multi_report_context(tool_results):
+    """Combine existing per-tool metric definitions under traceable call paths."""
+    catalog = {}
+    sources = {}
+    limitations = [
+        "本综合报告只使用列出的成功工具结果；不能证明指标之间存在相关性或因果关系。",
+        "不同工具可能使用不同时间窗口、样本成熟度、分母和统计单位，未经专门计算不得直接比较。",
+    ]
+    for index, item in enumerate(tool_results):
+        call_index = item["call_index"]
+        tool_name = item["tool_name"]
+        context = report_context(tool_name, item["data"])
+        prefix = f"/tool_results/{index}/data"
+        for path, label in context["metric_catalog"].items():
+            combined_path = prefix + path
+            catalog[combined_path] = f"调用{call_index} {tool_name}｜{label}"
+            sources[combined_path] = dict(call_index=call_index, tool_name=tool_name)
+        limitations.extend(
+            f"调用{call_index} {tool_name}：{value}"
+            for value in context["required_limitations"]
+        )
+    return dict(metric_catalog=catalog, metric_sources=sources,
+                required_limitations=limitations,
+                allowed_suggestions=list(SUGGESTIONS))
+
+
 class SemanticReportError(ValueError):
     """Stable local rejection reason, never contains model or user prose."""
 
@@ -146,5 +172,93 @@ def validate_semantics(report, data, context, resolve_path):
         reject("summary_evidence_mismatch")
     if any(s not in SUGGESTIONS for s in report["suggestions"]):
         reject("unverified_suggestion")
+    if report["limitations"] != context["required_limitations"]:
+        reject("methodology_limits_missing_or_changed")
+
+
+def validate_multi_semantics(report, data, context, resolve_path):
+    """Validate observed and cross-tool claims without inferring relationships."""
+    def reject(code):
+        raise SemanticReportError(code)
+
+    expected_fields = {"status", "summary", "summary_finding_indices",
+                       "summary_evidence", "key_findings", "limitations",
+                       "suggestions"}
+    if set(report) != expected_fields:
+        reject("invalid_semantic_report_fields")
+    descriptions = []
+    for finding in report["key_findings"]:
+        if set(finding) != {"title", "description", "claim", "evidence"}:
+            reject("invalid_semantic_finding_fields")
+        claim = finding.get("claim")
+        if not isinstance(claim, dict):
+            reject("unsupported_semantic_claim")
+        kind = claim.get("kind")
+        if kind == "observed":
+            if set(claim) != {"kind", "path"}:
+                reject("unsupported_semantic_claim")
+            path = claim.get("path")
+            label = context["metric_catalog"].get(path)
+            if label is None:
+                reject("unsupported_metric_definition")
+            value = resolve_path(data, path)
+            title = label
+            description = f"{label}：{json.dumps(value, ensure_ascii=False, allow_nan=False)}。"
+            evidence = [{"json_path": path, "value": value}]
+        elif kind == "cross_tool_observation":
+            if set(claim) != {"kind", "paths"} or not isinstance(claim.get("paths"), list):
+                reject("unsupported_semantic_claim")
+            paths = claim["paths"]
+            if len(paths) != 2 or len(set(paths)) != 2:
+                reject("invalid_cross_tool_claim")
+            if any(path not in context["metric_catalog"] for path in paths):
+                reject("unsupported_metric_definition")
+            sources = [context["metric_sources"][path] for path in paths]
+            if sources[0]["tool_name"] == sources[1]["tool_name"]:
+                reject("cross_tool_claim_requires_distinct_tools")
+            labels = [context["metric_catalog"][path] for path in paths]
+            values = [resolve_path(data, path) for path in paths]
+            title = "跨工具指标并列观察（不代表相关或因果）"
+            description = (
+                f"跨工具并列观察：{labels[0]}为"
+                f"{json.dumps(values[0], ensure_ascii=False, allow_nan=False)}；"
+                f"{labels[1]}为{json.dumps(values[1], ensure_ascii=False, allow_nan=False)}。"
+                "这些指标口径不同，仅表示本次结果同时出现，不代表相关性或因果关系。"
+            )
+            evidence = [
+                {"json_path": path, "value": value}
+                for path, value in zip(paths, values)
+            ]
+        else:
+            reject("unsupported_semantic_claim")
+        if finding["title"] != title or finding["description"] != description:
+            reject("unverified_semantic_statement")
+        if finding["evidence"] != evidence:
+            reject("claim_evidence_mismatch")
+        descriptions.append(description)
+
+    indices = report.get("summary_finding_indices")
+    if (not isinstance(indices, list) or not indices or
+            any(type(index) is not int or index < 0 or index >= len(descriptions)
+                for index in indices)):
+        reject("missing_summary_evidence")
+    if report["summary"] != "\n".join(descriptions[index] for index in indices):
+        reject("unverified_summary")
+    expected_summary = [
+        item for index in indices for item in report["key_findings"][index]["evidence"]
+    ]
+    if report.get("summary_evidence") != expected_summary:
+        reject("summary_evidence_mismatch")
+
+    for suggestion in report["suggestions"]:
+        if (not isinstance(suggestion, dict) or
+                set(suggestion) != {"text", "based_on_finding_indices"} or
+                suggestion.get("text") not in SUGGESTIONS):
+            reject("unverified_suggestion")
+        based_on = suggestion.get("based_on_finding_indices")
+        if (not isinstance(based_on, list) or not based_on or
+                any(type(index) is not int or index < 0 or index >= len(descriptions)
+                    for index in based_on)):
+            reject("suggestion_missing_evidence")
     if report["limitations"] != context["required_limitations"]:
         reject("methodology_limits_missing_or_changed")

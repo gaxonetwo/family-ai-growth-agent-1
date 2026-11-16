@@ -14,6 +14,7 @@ from src.agent.tool_schemas import SchemaValidationError
 
 _RELATIVE = re.compile(r"最近\s*\d+\s*天|本月|上个月|今年")
 _DATE_HINT = re.compile(r"\d{4}[-/年]\d{1,2}")
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def prepare_action_arguments(definition, resolver, arguments, user_input,
@@ -22,7 +23,9 @@ def prepare_action_arguments(definition, resolver, arguments, user_input,
     original = deepcopy(arguments)
     trace = dict(tool_name=definition.name, original_arguments=original,
                  date_expression=None, date_resolution=None, arguments={},
-                 conflicts=[], status="needs_clarification", error=None,
+                 normalized_date_placeholders=[], normalized_model_date_fields=[],
+                 conflicts=[],
+                 status="needs_clarification", error=None,
                  clarification_question=None)
 
     def clarify(code, question):
@@ -50,10 +53,31 @@ def prepare_action_arguments(definition, resolver, arguments, user_input,
     trace["date_expression"] = expression
     fields = TOOL_DATE_FIELDS.get(definition.name)
     resolved_arguments = {}
+    placeholder_fields = set()
     if fields is not None:
         schema_names = {p.name for p in definition.schema.parameters}
         if not set(fields) <= schema_names:
             return clarify("unsupported_date_schema", "工具日期字段与已登记的日期解析规则不一致，请检查工具配置。")
+        provided_fields = [field for field in fields if field in original]
+        if provided_fields and len(provided_fields) != len(fields):
+            return clarify("incomplete_date_arguments", "模型只提供了部分起止日期，请补充完整日期范围。")
+        # Some models repeat a verified relative expression in both concrete
+        # date fields. Those strings are placeholders, not competing dates.
+        # Only normalize the complete pair; mixed or ISO values still enter
+        # the ordinary conflict check below.
+        if (expression is not None and provided_fields and
+                all(original[field] == expression for field in fields)):
+            placeholder_fields = set(fields)
+            trace["normalized_date_placeholders"] = list(fields)
+        elif (expression is not None and _RELATIVE.fullmatch(expression) and
+              len(provided_fields) == len(fields) and
+              all(isinstance(original[field], str) and
+                  _ISO_DATE.fullmatch(original[field]) for field in fields) and
+              not any(original[field] in user_input for field in fields)):
+            # Absolute dates calculated by the model are not user evidence.
+            # For a verified relative expression, local calendar rules win.
+            placeholder_fields = set(fields)
+            trace["normalized_model_date_fields"] = list(fields)
         intent = next(key for key, value in INTENT_TOOL_MAP.items() if value == definition.name)
         # Only DateResolver consumes this adapter. 0.0 is an explicit unused
         # placeholder, not model confidence and never passed to IntentValidator.
@@ -75,9 +99,10 @@ def prepare_action_arguments(definition, resolver, arguments, user_input,
     elif expression is not None:
         return clarify("unsupported_date_schema", "该工具尚未登记日期字段映射，请明确工具参数或补充日期配置。")
 
-    merged = deepcopy(arguments)
+    merged = {key: deepcopy(value) for key, value in arguments.items()
+              if key not in placeholder_fields}
     for key, value in resolved_arguments.items():
-        if key in original and original[key] != value:
+        if key in original and key not in placeholder_fields and original[key] != value:
             trace["conflicts"].append(dict(parameter_name=key,
                 model_value=deepcopy(original[key]), date_resolver_value=value))
         else:
