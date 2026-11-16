@@ -19,6 +19,7 @@ family-ai-growth-agent-1/
 ├── database/
 ├── docs/
 ├── reports/
+└── README.md
 ├── scripts/
 ├── src/
 └── tests/
@@ -39,14 +40,17 @@ family-ai-growth-agent-1/
 
 \`\`\`text
 configs/
+├── README.md
 └── settings.yaml
 
 data/
+├── README.md
 ├── raw/
 ├── processed/
 └── ground_truth/
 
 database/
+├── README.md
 └── schema.sql
 \`\`\`
 
