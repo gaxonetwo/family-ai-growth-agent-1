@@ -1,142 +1,272 @@
-# 阶段4.5.1：单 Agent 基础执行循环
+# 单 Agent 执行循环
 
-## 业务价值
+## 1. 解决的问题
 
-运营任务可能需要先看活跃，再查看留存。`AgentController` 每轮把原始请求、Registry当前工具说明和真实执行结果交给同一个Provider，由模型选择下一步。Python不预设工具顺序，只控制允许的动作和安全边界。
+一个运营任务可能同时要求活跃、留存和综合分析。`AgentController` 不把这些步骤写成固定流程，而是在每轮把用户原始任务、当前工具描述和真实工具观察交给同一个Provider，由模型决定下一步。
 
-```text
-用户任务 -> 获取工具描述 -> 模型选择动作 -> 本地校验 -> ToolExecutor
-                                |                          |
-                         结束或请求澄清             保存真实观察，回到决策
+Python控制器负责约束动作、解析日期、验证参数、执行只读工具、保留状态和核验报告。模型不能直接执行SQL、Python或系统命令，也不能用一句 `finish` 绕过未完成任务检查。
+
+## 2. 执行循环
+
+```mermaid
+flowchart TD
+    S[开始：保存用户原文] --> C[构建本轮上下文]
+    C --> P[Provider生成一个JSON动作]
+    P --> V{动作类型}
+    V -->|clarify| Q[返回澄清问题]
+    Q --> U[用户补充回答]
+    U --> C
+    V -->|call_tool| N[核验工具名与只读属性]
+    N --> A[ActionParameters + DateResolver]
+    A --> SC[真实Tool Schema校验]
+    SC --> E[ToolExecutor执行]
+    E --> O{执行结果}
+    O -->|失败| F[停止并保留已有观察]
+    O -->|成功| R[保存真实观察]
+    R --> C
+    V -->|finish| D{待办为空且调用均成功?}
+    D -->|否| Q
+    D -->|是| X[可选：单/多工具结果解释]
+    X --> M[证据与语义校验]
+    M --> Z[返回最终结果]
 ```
 
-每次只执行一个工具，可连续调用不同工具。四个业务函数、Schema、只读SQLQueryTool保持原样。控制器不直接操作业务表、SQL或系统命令。
+`run(user_input, reference_date=None)` 创建一次新的本地状态。`continue_with_clarification(previous_result, answer)` 只接受此前真实返回的 `needs_clarification` 结果，并从防御性拷贝恢复任务。
 
-## 动作协议
+## 3. 三种动作
+
+Provider每轮只能返回一种合法JSON动作。
+
+### call_tool
 
 ```json
-{"action":"call_tool","tool_name":"analyze_user_activity","arguments":{"start_date":"2026-11-07","end_date":"2026-11-13"}}
+{
+  "action": "call_tool",
+  "tool_name": "analyze_user_activity",
+  "arguments": {},
+  "date_expression": "最近7天",
+  "remaining_tasks": [
+    {
+      "summary": "留存分析",
+      "evidence": "再分析上个月注册用户的留存情况"
+    },
+    {
+      "summary": "综合分析",
+      "evidence": "最后综合分析这两个结果"
+    }
+  ]
+}
 ```
+
+每次只执行一个工具。`date_expression` 必须是用户原文片段；`remaining_tasks` 推荐把模型摘要和用户逐字证据分开。兼容直接返回原文字符串，但不能用模型改写替代证据。
+
+### clarify
 
 ```json
-{"action":"clarify","question":"你希望分析哪段注册日期的留存？"}
+{
+  "action": "clarify",
+  "question": "你希望分析最近多少天的用户留存情况？"
+}
 ```
+
+信息不足、日期冲突、Schema不完整或模型无法提供任务原文证据时，控制器停止执行并把问题交给用户。
+
+### finish
 
 ```json
-{"action":"finish"}
+{
+  "action": "finish",
+  "remaining_tasks": []
+}
 ```
 
-模型每次只能返回一种动作，不能增加任意字段。阶段4.5.2额外允许call_tool携带`date_expression`，三种动作均可携带`remaining_tasks`。其余字段仍拒绝。finish表示选择停止，不表示业务问题已经被独立验证解决；没有工具调用时观察为空，不生成虚构业务结论。
+`finish`只表示模型选择停止。控制器还会检查：
 
-## 可运行的离线示例
+- 已核验的待办任务是否为空；
+- 是否至少有一个真实观察；
+- 所有已执行工具是否成功。
 
-在项目根目录的Python会话中运行以下代码。所有工具函数都被替换为假函数，不连接正式数据库。预设动作只演示循环，不代表Mock理解了问题。
+如果仍有待办，返回 `needs_clarification/unfinished_tasks`，不会把任务标记为完成。
 
-```python
-from dataclasses import replace
-from src.agent.action_provider import MockActionProvider
-from src.agent.agent_controller import AgentController
-from src.agent.tool_registry import create_default_tool_registry
+## 4. 工具发现与选择
 
-registry = create_default_tool_registry()
-for definition in registry.list_tools():
-    registry.unregister_tool(definition.name)
-    registry.register_tool(replace(
-        definition, execute=lambda **kwargs: {"demo_only": True, "users": 12}
-    ))
+每轮调用 `registry.get_tool_descriptions()`，得到当前工具的名称、业务用途、只读属性和真实Schema。Registry发生变化时，下一轮立即读取新状态，不使用写死的旧工具列表。
 
-actions = [
-    {"action": "call_tool", "tool_name": "analyze_user_activity",
-     "arguments": {"start_date": "2026-11-07", "end_date": "2026-11-13"}},
-    {"action": "call_tool", "tool_name": "analyze_retention",
-     "arguments": {"cohort_start": "2026-08-16", "cohort_end": "2026-10-14"}},
-    {"action": "finish"},
-]
-provider = MockActionProvider(response_factory=lambda prompt, context, n: {
-    "output": actions[n - 1], "model": "offline-demo", "finish_reason": "stop"
-})
-result = AgentController(provider, registry, max_tool_calls=2).run(
-    "分析2026-11-07至2026-11-13活跃和2026-08-16至2026-10-14注册用户留存。"
-)
-print(result["status"], result["tool_calls"])
-# completed 2；users=12为假数据，没有正式业务含义。
-```
+模型只能从这些工具中选择：
 
-## 复用、安全与返回结构
+- `analyze_activation_funnel`
+- `analyze_retention`
+- `analyze_user_activity`
+- `analyze_feedback_trends`
 
-DeepSeekProvider新增`generate_action()`，共用原有JSON请求、环境配置、有限网络重试及安全错误码。`generate_intent()`和`generate_report()`保持兼容。MockActionProvider复用已有MockIntentProvider的预设响应、工厂、异常和调用记录，没有关键词分类逻辑。只有调用方显式注入Live Provider并运行控制器才会访问模型，本批次未新增CLI。
+AgentController根据精确名称再次查询Registry，并拒绝不存在或非只读工具。它不使用字符串相似度动态导入函数。
 
-控制器默认使用四工具Registry；注入空Registry不会悄悄替换。注入Executor必须使用同一Registry。每次调用检查注册状态与只读标记，复用`schema.validate()`补齐默认值，并检查日期起止顺序；Executor会再次校验并执行注册函数。未注册函数、任意SQL、额外内部参数不会被执行。
+## 5. 原始任务和真实观察如何进入下一轮
 
-返回包含`ok`、`status`、`user_input`、`tool_calls`、`observations`、`decisions`、`explanations`、`clarification_question`、`error`；阶段4.5.2增加`task_context`与`parameter_checks`。每条观察保留call_index、工具名、最终参数、Executor完整结果信封，数据和错误不会被模型改写。运行状态在每次run局部创建，返回深拷贝。
+每轮Provider上下文包含：
 
-- completed：模型主动结束；ok=True表示循环正常结束，不保证任务分析完整。
-- needs_clarification：模型询问或参数校验失败；返回中文问题，外部调用方负责接收回答。
-- unsupported：工具不存在、空Registry或工具非只读。
-- model_output_invalid：动作、响应元数据不合法或输出截断。
-- failed：工具或Provider失败、上下文过大；此前观察仍保留。
-- limit_reached：达到调用上限后模型再次要求执行工具。
+- 完整 `user_input`；
+- Registry当前工具描述；
+- 完整 `observations`；
+- 澄清问答历史和所有用户消息；
+- 已复用调用；
+- 原始任务、已核验待办和已完成调用摘要；
+- 参考日期和剩余工具调用次数。
 
-max_tool_calls默认4，允许1至20。达到上限仍允许一次决策来结束或澄清，但不执行额外工具。动作请求最多max_tool_calls+1次，不含Provider内部的有限网络重试；工具失败不重试。上下文默认限60000字符，超限明确失败，不静默截断。
-
-默认不生成报告。显式设置`explain_results=True`复用ResultExplainer逐一解释成功结果；解释失败不改变工具成功状态，解释文本不参与下一轮决策。可选解释会产生额外模型请求，本阶段没有跨工具综合报告。
-
-## 当前限制与验证
-
-参数校验只保证Schema约束合法，不证明所有模型参数完全符合用户原意。阶段4.5.2已接入现有DateResolver，日期依据和参数冲突可以追踪；尚未移植完整参数证据机制或澄清后的会话恢复。没有复杂反思、长期记忆、任务调度或多Agent，也不保证并发修改Registry的原子性。
-
-## 阶段4.5.2：上下文和参数可靠性
-
-`run(user_input, reference_date=None)`保留原有调用方式，并支持显式参考日；构造函数允许注入`date_resolver=DateResolver(settings_path)`供独立测试使用。参考日优先调用方，其次配置中的dataset_end_date。两者均无效时请求澄清，不使用电脑当天日期。
-
-每轮请求都包含完整原文、完整真实观察、成功执行的工具调用摘要、待办提示和调用次数余额。原文不会被上一轮输出替换。可选`remaining_tasks`仅接受原文中的非空片段；它是模型的进度提示，不是语义完成证明。未提供时保留之前的提示，初始值为完整请求，completion_verified始终为false。
-
-`src/agent/action_parameters.py`衔接DateResolver和真实Schema：
-
-1. 验证显式date_expression确实出现在原文中；没有该字段时，唯一的“最近7天”“最近30天”“本月”“上个月”“今年”表达可以自动定位。
-2. 原文存在多个时间范围时，请求模型明确选择原文片段；无法选择则停止并澄清。
-3. 复用DateResolver处理相对日期或ISO范围，复用其工具字段映射，并与当前Schema的字段核对。
-4. 合并模型参数与本地日期结果，值不同时保留双方并澄清，不静默覆盖。
-5. 调用真实schema.validate()补齐默认值，检查日期顺序，再交Executor执行。
-
-绝对ISO范围可以通过`date_expression`选择，也可兼容旧动作的显式日期参数。未提供日期表达时，不会仅因为任务某处出现ISO日期，就自动替空动作填写范围；旧动作缺少必要参数仍请求澄清。旧格式的直接日期参数尚未进行完整原文语义核验。
-
-IntentValidator绑定意图候选、模型置信度与证据契约，动作协议不具备全部信息，因此不伪造模型置信度来调用它。衔接模块只构造供DateResolver使用的现有IntentDraft与ToolMatchResult；其中confidence=0.0明确为不参与计算的适配占位，不代表模型评分，也不通过它绕过置信度验证。参数约束仍来自同一Registry Schema，没有复制四套业务参数。
-
-相对日期动作示例：
+观察记录以下内容：
 
 ```json
-{"action":"call_tool","tool_name":"analyze_user_activity","arguments":{},"date_expression":"最近7天","remaining_tasks":["再分析上个月留存"]}
+{
+  "call_index": 1,
+  "tool_name": "analyze_user_activity",
+  "arguments": {
+    "start_date": "2026-11-07",
+    "end_date": "2026-11-13"
+  },
+  "result": {
+    "ok": true,
+    "tool_name": "analyze_user_activity",
+    "data": {},
+    "error": null,
+    "metadata": {"execution_status": "success"}
+  }
+}
 ```
 
-上述待办片段必须存在于真实用户原文。参考日2026-11-13时，本地得到start_date=2026-11-07、end_date=2026-11-13；若工具是留存或激活，则得到cohort_start、cohort_end。
+下一轮读取的是Executor真实结果，不是模型对结果的复述。可选解释不会回流成工具观察。
 
-复用上方离线示例的假工具Registry，可运行：
+## 6. 日期解析与参数冲突
 
-```python
-actions = [
-    {"action": "call_tool", "tool_name": "analyze_user_activity",
-     "arguments": {}, "date_expression": "最近7天", "remaining_tasks": ["再分析上个月留存"]},
-    {"action": "call_tool", "tool_name": "analyze_retention",
-     "arguments": {}, "date_expression": "上个月", "remaining_tasks": []},
-    {"action": "finish"},
-]
-provider = MockActionProvider(response_factory=lambda p, c, n: {
-    "output": actions[n - 1], "model": "offline-demo", "finish_reason": "stop"
-})
-result = AgentController(provider, registry).run(
-    "先分析最近7天活跃，再分析上个月留存", reference_date="2026-11-13"
-)
-print([(o["tool_name"], o["arguments"]) for o in result["observations"]])
-```
+`ActionParameters` 不实现日期运算，而是连接用户证据、`DateResolver`和真实Schema。
 
-parameter_checks保留原始动作参数、原文日期片段、DateResolver的参考日及来源、最终参数和冲突明细。日期能解析不代表数据库覆盖完整；例如“今年”可能超出模拟数据期，业务工具仍按原有覆盖规则拒绝执行。当前不处理任意自然语言、否定语境或复杂时间范围归属；不确定时需要澄清。没有增加澄清恢复或跨工具报告。
+处理规则：
+
+1. 核验显式 `date_expression` 能在原任务或澄清回答中找到；
+2. 只有一个支持的相对表达时可自动定位；多个日期范围时要求本次动作明确选择原文片段；
+3. DateResolver 本地支持最近7天、最近30天、本月、上个月、今年及明确ISO范围；
+4. 参考日期优先使用调用方参数，否则读取配置的 `dataset_end_date`，不使用电脑当前日期；
+5. 激活/留存映射为 `cohort_start/cohort_end`，活跃/反馈映射为 `start_date/end_date`；
+6. 模型把“最近7天”重复填入两个日期字段时，将其识别为占位符；
+7. 模型自行推导、但用户没有明确提供的ISO日期不能覆盖本地相对日期结果；
+8. 用户明确给出的ISO日期与本地结果冲突时，保留双方并请求澄清；
+9. 起止日期不完整、格式无效、表达不支持或起始晚于结束都会停止执行。
+
+例如参考日为 `2026-11-13`：
+
+- 最近7天 → `2026-11-07` 至 `2026-11-13`；
+- 上个月 → `2026-10-01` 至 `2026-10-31`。
+
+参数检查轨迹保存在 `parameter_checks`，包括原参数、日期表达、参考日来源、本地解析、标准化字段、冲突和最终参数。
+
+## 7. Schema校验与工具执行
+
+ActionParameters调用工具定义中的真实 `schema.validate()`：
+
+- 拒绝缺少必填字段；
+- 拒绝多余字段和类型错误；
+- 检查日期格式、枚举、整数范围和数组唯一性；
+- 补充Schema默认值；
+- 检查通用起止日期顺序。
+
+通过后才调用 `ToolExecutor.execute()`。Executor从同一Registry重新获取定义并再次验证，然后只调用已保存的Python函数引用。参数错误时工具不会执行；业务工具异常和显式 `ok=False` 都返回失败信封。
+
+## 8. remaining_tasks 原文证据核验
+
+模型可以总结任务，但总结不是用户事实。控制器只把 `evidence` 中能在原请求或澄清回答里逐字找到的内容加入 `pending_tasks`；摘要单独保存在 `pending_task_summaries`。
+
+以下原请求：
+
+> 先分析最近7天的用户活跃情况，再分析上个月注册用户的留存情况，最后综合分析这两个结果。
+
+可核验证据是：
+
+1. `先分析最近7天的用户活跃情况`
+2. `再分析上个月注册用户的留存情况`
+3. `最后综合分析这两个结果`
+
+“综合分析活跃和留存两个结果”虽然语义接近，但不是用户原文，不能直接进入待办。证据不存在、为空或重复时返回 `unverified_remaining_tasks`。
+
+## 9. 澄清恢复与结果复用
+
+`continue_with_clarification()`：
+
+- 保留原始任务，不用回答覆盖它；
+- 单独保存问题和用户回答；
+- 保留观察、决策、参数检查和待办；
+- 最多允许两轮澄清；
+- 空回答、对已完成结果继续澄清或伪造previous_result会被拒绝。
+
+恢复后如果模型再次请求完全相同的成功工具和最终参数，控制器按指纹复用原观察，不重复访问业务工具。一次恢复中反复请求同一已完成调用会返回 `repeated_completed_tool_call`，避免死循环。
+
+## 10. 多工具综合报告
+
+构造函数设置 `explain_results=True` 时：
+
+1. 每个成功工具可调用 `ResultExplainer.explain()`；解释失败不改变工具成功状态。
+2. 至少两个不同工具成功、待办为空且 `completion_verified=True` 后，调用 `explain_multiple()`。
+3. 综合输入包含每次调用的工具名、最终参数和业务数据。
+4. 报告只能引用指标目录登记的JSON Pointer和原始值。
+5. 跨工具发现只允许“并列观察”，必须明确不代表相关或因果。
+
+如果任一工具失败，循环停止并保留之前成功结果；不会生成伪成功综合报告。
+
+## 11. 报告证据和语义验证
+
+`ResultExplainer`先检查报告结构和证据：
+
+- 路径真实存在；
+- 值与原业务结果严格相等；
+- Summary只由已验证发现组成；
+- 建议只能来自允许的进一步分析方向；
+- 限制说明不能被模型删除或改写。
+
+`ReportSemantics`使用受限声明协议：
+
+- 单工具支持已登记指标的直接观测，以及满足公式条件的DAU首尾变化；
+- 多工具支持直接观测和两个不同工具指标的保守并列；
+- 拒绝把DAU/WAU/MAU当留存率、事件数当用户数、均值当峰值；
+- 拒绝把首尾变化描述为持续趋势；
+- 拒绝没有数据支持的因果和建议事实化。
+
+这是一套保守的确定性校验，不是通用自然语言理解系统。不支持的表述会失败，而不是猜测通过。
+
+## 12. 完整双工具案例
+
+用户任务：
+
+> 先分析最近7天的用户活跃情况，再分析上个月注册用户的留存情况，最后综合分析这两个结果。
+
+参考日期：`2026-11-13`。
+
+执行过程：
+
+1. 第一轮选择 `analyze_user_activity`，日期证据为“最近7天”。
+2. DateResolver得到 `start_date=2026-11-07`、`end_date=2026-11-13`。
+3. Schema与Executor通过后产生第一条真实观察。
+4. 第二轮上下文包含第一条完整观察；模型选择 `analyze_retention`，日期证据为“上个月”。
+5. DateResolver按留存工具字段得到 `cohort_start=2026-10-01`、`cohort_end=2026-10-31`。
+6. 第二条真实观察成功后，模型返回 `finish` 和空待办。
+7. 控制器核验调用均成功且任务完成，才请求综合报告。
+8. 报告只能引用两次调用的真实路径和值，并通过 `ReportSemantics`。
+
+离线端到端测试会检查工具实际调用次数、名称、参数、第二轮上下文、失败停止、重复调用保护和综合报告证据。Fake结果不代表真实数据库或真实DeepSeek输出。
+
+## 13. 调用上限和安全边界
+
+- `max_tool_calls` 默认4，允许1至20；达到上限不再执行新工具。
+- `max_context_chars` 默认60000；超限明确失败，不静默截断观察。
+- Provider响应必须有合法JSON、模型名和 `finish_reason=stop`；截断结果拒绝处理。
+- 工具失败不自动重试，避免重复执行。
+- 只允许Registry中的只读工具；不开放任意SQL、Python、系统命令或内部数据库路径。
+- Agent没有长期记忆、并行工具执行、任务持久化、复杂反思、多Agent或LangGraph。
+
+## 14. 验证命令
 
 ```powershell
-python -m unittest discover -s tests -p "test_agent_controller.py" -v
-python -m unittest discover -s tests -p "test_agent_context.py" -v
+python -m pytest tests/test_agent_controller.py tests/test_agent_context.py -q
+python -m pytest tests/test_agent_clarification_recovery.py -q
+python -m pytest tests/test_agent_acceptance.py tests/test_multi_tool_result_explainer.py -q
 python -m pytest -q
-git diff --check
 ```
 
-专项测试使用Mock、Fake工具和Fake SDK，阻止SQL、数据库连接及真实网络。完整历史回归包含已有的只读正式模拟数据检查，不得为测试重新生成数据。
+自动化测试使用Mock/Fake Provider和独立测试数据，不发送真实DeepSeek请求。

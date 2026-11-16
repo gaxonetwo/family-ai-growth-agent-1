@@ -1,268 +1,239 @@
 # Family AI Growth Agent
 
-面向 Family AI 智能硬件与软件产品的运营分析 Agent 项目。项目采用“单 Agent 自主规划 + 工具调用”的路线，优先使用免费、本地可运行的技术。
+面向 Family AI 智能硬件与软件产品的运营分析项目。系统让运营人员用自然语言提出问题，由一个**单 Agent**读取工具说明、选择下一步动作、校验参数、调用只读业务工具，并根据真实观察继续执行或结束任务。
 
-## 当前进度
+项目重点不在聊天界面，而在一条可测试、可追踪的分析链路：模型负责决策，Python 负责工具白名单、日期计算、参数校验、执行边界和报告证据验证。
 
-第一阶段：模拟业务数据集与 SQLite 数据库。
+> 项目中的用户、设备、事件、反馈和支付数据均为合成数据，不代表真实公司或真实用户；`data/ground_truth/` 仅用于离线评估，不向 Agent 开放。
 
-- 生成模拟用户、设备、行为事件、用户反馈、付费记录。
-- 单独生成用户场景标签和反馈分类标签（ground truth），不混入业务数据表，避免 Agent 直接读取答案。
-- 执行数据质量检查。
-- 将 CSV 数据导入 SQLite。
-- 已实现只读 SQL 查询工具。
-- 已实现用户激活漏斗分析工具。
-- 已实现精确日期用户留存分析工具。
-- 已实现 DAU、滚动 WAU 和滚动 MAU 用户活跃分析工具。
-- 已实现反馈主题、情感与负面趋势分析工具。
-- 已实现四个业务工具的统一注册、参数发现、校验和安全执行入口。
+## 1. 项目简介
 
-> 所有数据均为合成数据，不代表任何真实公司或真实用户。反馈文本为虚构的产品体验描述，不包含真实家庭成员、儿童语音、视频或聊天内容。
+Family AI Growth Agent 已实现四个运营分析工具和一个有边界的单 Agent 执行循环，支持：
 
-## 环境要求
+- 根据当前任务与工具真实返回结果，逐轮选择 `call_tool`、`clarify` 或 `finish`；
+- 连续调用多个不同业务工具，而不是把调用顺序写成固定 Workflow；
+- 解析“最近7天、最近30天、本月、上个月、今年”和明确 ISO 日期范围；
+- 在执行前完成工具白名单、只读属性、参数类型、枚举、日期和 Schema 校验；
+- 最多两轮用户澄清，并在恢复后复用已经成功的工具结果；
+- 对单工具和多工具报告执行 JSON 证据路径、原始数值及语义约束校验。
+
+项目没有使用 LangGraph、AutoGen、CrewAI 或多 Agent 架构。当前控制器属于普通 Python 实现的、有调用上限的单 Agent 循环，不具备长期记忆和开放式自主规划能力。
+
+## 2. 项目背景与解决的问题
+
+运营人员通常需要把“最近活跃怎么样”“新用户留存如何”“负面反馈在增长吗”等问题拆成取数、口径确认、指标计算和报告编写。直接让大模型生成 SQL 或数字存在三类风险：
+
+1. 工具和数据权限不可控；
+2. 相对日期、分母、独立用户等业务口径容易混淆；
+3. 报告可能引用真实数字却得出没有证据的趋势或因果结论。
+
+本项目把职责拆开：业务函数计算指标，Registry/Schema/Executor 管理安全调用，Agent 只在允许的动作空间内决策，ResultExplainer 与 ReportSemantics 对报告做本地确定性复核。
+
+## 3. 核心功能
+
+| 能力 | 当前实现 |
+|---|---|
+| 单 Agent 决策 | 每轮读取原始任务、工具描述、澄清历史和真实观察，选择一个动作 |
+| 多工具连续执行 | 一次只调用一个工具，观察结果进入下一轮；默认最多4次工具调用 |
+| 工具安全 | 仅执行 Registry 中注册且标记只读的函数；不允许模型执行 SQL、Python 或系统命令 |
+| 日期可靠性 | DateResolver 本地计算相对日期，不使用电脑当前日期兜底 |
+| 参数可靠性 | ActionParameters 合并本地日期和模型参数，冲突时停止并澄清；Schema 再校验 |
+| 澄清恢复 | 保存原请求、回答、观察和参数检查；最多两轮；相同成功调用不重复执行 |
+| 进度核验 | `remaining_tasks` 必须附用户原文证据，模型摘要不能直接成为待办事实 |
+| 结果解释 | 支持单工具解释和完成状态核验后的多工具综合报告 |
+| 报告可信性 | JSON Pointer 路径和值必须对应原始结果；语义规则拒绝因果、口径混淆和无证据结论 |
+| 离线验证 | Mock/Fake Provider、临时SQLite和Fake工具覆盖核心链路，不自动访问真实模型 |
+
+此外，项目保留 `IntentPipeline` 单意图链路，用于演示“自然语言 → 意图 → 工具匹配 → 日期解析 → 参数验证 → 可选单工具执行”；它与支持多工具循环的 `AgentController` 是两个不同入口。
+
+## 4. 系统架构图
+
+```mermaid
+flowchart TD
+    U[运营人员自然语言任务] --> AC[AgentController]
+    AC --> TR[ToolRegistry<br/>工具描述与白名单]
+    TR --> AC
+    AC --> AP[ActionProvider]
+    AP --> DS[DeepSeekProvider / MockActionProvider]
+    DS --> A[call_tool / clarify / finish]
+    A --> AC
+
+    AC -->|call_tool| PA[ActionParameters]
+    PA --> DR[DateResolver]
+    DR --> TS[Tool Schema 校验]
+    TS --> TE[ToolExecutor]
+    TE --> BT{四个只读业务工具}
+    BT --> SQL[SQLQueryTool<br/>SQLite mode=ro]
+    SQL --> DB[(合成业务数据库)]
+    BT --> O[真实工具观察]
+    O --> AC
+
+    AC -->|clarify| U
+    AC -->|finish 且完成状态通过| RE[ResultExplainer]
+    O --> RE
+    RE --> RS[ReportSemantics<br/>证据与语义校验]
+    RS --> R[最终结构化报告]
+```
+
+更详细的模块职责见 [系统架构说明](docs/architecture.md) 和 [Agent执行循环](docs/basic_agent_loop.md)。
+
+## 5. Agent 工作流程
+
+1. `AgentController` 从 Registry 动态读取当前工具名称、用途和真实参数 Schema。
+2. Provider 根据原始任务、澄清历史、已经完成的调用和真实观察返回一个 JSON 动作。
+3. `call_tool` 先检查工具是否存在且只读，再由 `ActionParameters` 处理日期表达与参数冲突。
+4. `DateResolver` 使用显式 `reference_date`，否则使用 `configs/settings.yaml` 的 `dataset_end_date`；禁止使用电脑当前日期兜底。
+5. Tool Schema 校验必填字段、类型、枚举、日期格式、额外字段和默认值；`ToolExecutor` 执行前再次校验。
+6. 成功结果作为 observation 原样进入下一轮。失败立即停止，不伪装成功、不自动重试业务工具。
+7. `clarify` 返回中文问题；调用方可最多两次使用 `continue_with_clarification()` 恢复原任务。
+8. `finish` 不是无条件完成。仍有经过原文核验的待办任务时，控制器返回 `needs_clarification`。
+9. 启用解释后，报告必须引用原始路径和值并通过语义校验；解释失败不会改写已经成功的工具执行结果。
+
+## 6. 四个业务分析工具
+
+所有时间按 UTC 统计，起止日期包含当天。默认完整数据范围由配置推导为 `2026-08-16` 至 `2026-11-13`；配置声明不能证明区间内部不存在采集中断。
+
+| 工具 | 业务目标 | 核心口径 |
+|---|---|---|
+| `analyze_activation_funnel` | 注册、绑定、引导、首次AI交互漏斗 | 默认注册后7天；严格顺序为注册 ≤ 绑定 ≤ 引导 ≤ AI；仅统计观察窗口完整的用户 |
+| `analyze_retention` | D1/D7/D30精确日期留存 | 有效事件为 `app_open`、`ai_interaction`；按最大留存日筛选共同成熟样本 |
+| `analyze_user_activity` | DAU、滚动WAU、滚动MAU和事件量 | 有效事件为 `app_open`、`ai_interaction`、`feature_use`；窗口不足返回 `None`，不是0 |
+| `analyze_feedback_trends` | 反馈量、规则主题/情感、负面趋势和分组 | Python规则分类，不调用LLM；`unknown` 不合并到 `neutral`；稳定分页并检测截断 |
+
+留存率和激活率使用 `0～1` 小数。事件记录数不能当作独立用户数。`plan_type` 是 `users` 表中的当前套餐快照，不能还原历史套餐。活跃首尾变化不能证明持续趋势；反馈情感是规则标签，不等同于真实满意度。
+
+## 7. 技术栈
 
 - Python 3.10+
-- pip
+- SQLite、标准库 `sqlite3`
+- pandas 2.x（数据生成与整理）
+- OpenAI Python SDK（调用 DeepSeek 的 OpenAI 兼容接口）
+- pytest、unittest
+- JSON Schema 风格的自研轻量参数校验
+- Mermaid（文档架构图）
 
-## 快速开始
+核心 Agent 不依赖 LangGraph 或其他 Agent 框架。
 
-建议在项目根目录执行：
-
-```bash
-python -m venv .venv
-```
-
-Windows PowerShell：
+## 8. 项目快速开始
 
 ```powershell
+python -m venv .venv
 .venv\Scripts\Activate.ps1
-```
-
-macOS / Linux：
-
-```bash
-source .venv/bin/activate
-```
-
-安装依赖：
-
-```bash
 pip install -r requirements.txt
 ```
 
-生成数据：
+业务CSV和 `family_ai.db` 被 Git 忽略。已有本地数据时不要重新生成；全新克隆且确实需要合成数据时，才运行：
 
-```bash
-python -m src.data.generate_data --users 1000 --days 90 --seed 42
+```powershell
+python scripts/run_phase1.py
 ```
 
-检查数据：
+单独运行四个业务工具：
 
-```bash
-python -m src.data.validate_data
-```
-
-导入 SQLite：
-
-```bash
-python -m src.data.load_sqlite
-```
-
-完成后会生成：
-
-- `data/raw/*.csv`
-- `data/ground_truth/user_scenarios.csv`
-- `data/ground_truth/feedback_labels.csv`
-- `data/processed/family_ai.db`
-
-## 数据表
-
-| 表 | 用途 |
-|---|---|
-| users | 用户注册、渠道、地区、套餐 |
-| devices | 设备绑定与当前状态 |
-| events | App、AI 功能和设备行为事件 |
-| feedback | 用户反馈及模拟分类标签 |
-| payments | 付费订单 |
-| user_scenarios | 仅用于测试评估的模拟场景标签 |
-
-## 重要设计约定
-
-### 三个业务工具统一口径（质量完善）
-
-所有指标按 UTC 计算；cohort/趋势起止日期包含当天。默认完整数据覆盖声明为 2026-08-16 至 2026-11-13，来自 settings.yaml 的 dataset_end_date 和 default_days；这一声明不能自动证明区间内没有采集中断。
-
-| 工具 | 有效依据 | 时间窗口和限制 |
-|---|---|---|
-| 激活 | devices.bound_at；onboarding_complete；ai_interaction | 默认注册后7天，窗口左闭右开；严格要求 注册 <= 绑定 <= 引导 <= AI；各阶段独立用户去重，只统计完整观察窗口用户 |
-| 留存 | app_open、ai_interaction | Exact-day：UTC注册日期+n日；默认D1/D7/D30共用成熟到D30的用户分母；不是区间留存 |
-| 活跃 | app_open、ai_interaction、feature_use | DAU当天，WAU含当天及前6天，MAU含当天及前29天；历史不足返回None，覆盖外请求报错 |
-
-激活允许相等时间；每步寻找满足前置条件的最早事件，早期乱序事件不阻止后续合法事件完成激活。查询按注册日分批，保持 SQLQueryTool 执行限制。中间结果物化语法需要 SQLite 3.35+。
-
-留存率、激活率以0～1返回；活跃输出人数而非比例。套餐分组使用当前套餐快照，不能还原历史套餐。活跃趋势仅首尾对比，不能证明持续变化或原因。严格顺序可能排除模拟数据中引导早于绑定的用户，不能据此直接断言真实产品引导问题。
-
-1. `user_scenarios.csv` 是评估标签，不应作为 Agent 的业务查询数据源。
-2. `events` 是事件事实表；`devices.current_status` 表示数据集结束时的设备状态。
-3. 留存、激活、功能使用和付费指标应在后续分析模块中统一定义口径。
-4. 所有时间字段使用 ISO 8601 格式，默认按 UTC 存储；本项目的模拟数据不对应真实地域时区。
-5. 不将真实儿童信息、语音、视频、聊天记录或家庭隐私放入项目数据。
-
-## 用户激活漏斗分析
-
-激活定义：用户注册后的观察窗口内，同时完成设备绑定、新手引导和至少一次 AI 交互。默认观察窗口为 7 天，只统计拥有完整观察窗口的注册用户。
-
-漏斗采用累计口径：新手引导阶段只统计已经绑定设备的用户，首次 AI 交互阶段只统计已经完成前两步的用户。日期和时间统一按 UTC 计算，窗口为 `[注册时间, 注册时间 + observation_days)`。
-
-运行示例：
-
-```bash
+```powershell
 python -m src.tools.demo_activation_funnel 2026-08-16 2026-11-06 --observation-days 7
-```
-
-在 Python 中调用：
-
-```python
-from src.analytics.activation import analyze_activation_funnel
-
-result = analyze_activation_funnel("2026-08-16", "2026-11-06", 7)
-```
-
-运行独立单元测试（仅使用 Python 标准库，测试会创建临时数据库，不修改正式数据）：
-
-```bash
-python -m unittest discover -s tests -p "test_activation.py" -v
-```
-
-## 用户留存分析
-
-留存采用 Exact-day Retention：D1、D7、D30 分别表示用户在注册日期后的第 1、7、30 个 UTC 日历日，是否至少发生一次 `app_open` 或 `ai_interaction`。多个指标统一使用已经完整观察到最大请求天数的成熟用户作为分母。
-
-运行总体留存分析：
-
-```bash
-python -m src.tools.demo_retention 2026-08-16 2026-10-14
-```
-
-按获客渠道分组：
-
-```bash
 python -m src.tools.demo_retention 2026-08-16 2026-10-14 --breakdown-by acquisition_channel
-```
-
-也可使用 `--breakdown-by plan_type`，或用 `--data-through-date YYYY-MM-DD` 显式指定可靠的数据截止日期。未指定时读取 `configs/settings.yaml` 的 `dataset_end_date`。
-
-运行独立测试：
-
-```bash
-python -m unittest discover -s tests -p "test_retention.py" -v
-```
-
-## 用户活跃分析
-
-支持关键字参数 `as_of_date`（默认 end_date）、`breakdown_by`（acquisition_channel 或 plan_type）。返回基准日 `dau/wau/mau`、`daily_trend`、分组 `breakdown` 和首尾 DAU 对比 `trend_analysis`。套餐取当前 users.plan_type，不代表历史套餐。首尾对比不能证明持续趋势或业务原因。
-
-无参数演示：`python -m src.tools.demo_user_activity`，展示配置截止日指标及渠道、套餐分组。日期参数仍可指定趋势区间。
-
-有效活跃事件包括 `app_open`、`ai_interaction` 和 `feature_use`。DAU 是某个 UTC 自然日内的独立活跃用户数；WAU 是截至该日向前 7 个自然日内的独立活跃用户数；MAU 是截至该日向前 30 个自然日内的独立活跃用户数。
-
-事件记录数与活跃用户数会分别返回。同一个用户一天产生多条事件，只增加事件记录数，不会被重复计入 DAU、WAU 或 MAU。
-
-```bash
 python -m src.tools.demo_user_activity 2026-10-15 2026-11-13
+python -m src.tools.demo_feedback_trends 2026-08-16 2026-11-13 --analysis-mode rules
 ```
 
-数据完整覆盖范围默认根据 `configs/settings.yaml` 中的 `dataset_end_date` 和 `default_days` 计算。请求超出覆盖范围会报错；WAU 或 MAU 的历史窗口不完整时返回 `None`，不会把缺失数据表示为零活跃。
+运行全部测试：
 
-运行独立测试：
-
-```bash
-python -m unittest discover -s tests -p "test_user_activity.py" -v
+```powershell
+python -m pytest -q
 ```
 
-## 用户反馈趋势分析
+## 9. Mock 和 DeepSeek 两种运行方式
 
-`analyze_feedback_trends()` 使用 feedback 和 users，通过现有只读 SQLQueryTool 查询，复用规则版本1.0.0的 `classify_feedback_text()`，不调用大模型API，不读取ground_truth，不将分类标签写入数据库。
+### 离线 Mock
+
+`demo_intent` 默认使用预设 Mock，只演示单意图链路，不访问网络：
+
+```powershell
+python -m src.tools.demo_intent --reference-date 2026-11-13
+```
+
+增加 `--execute` 后，只有验证通过才会调用一个真实只读业务工具：
+
+```powershell
+python -m src.tools.demo_intent --execute --reference-date 2026-11-13
+```
+
+多工具 Agent 的离线验收使用 `MockActionProvider`、Fake工具和 `AgentController`，参见 [Agent执行循环](docs/basic_agent_loop.md) 与 `tests/test_agent_acceptance.py`。
+
+### DeepSeek Live
+
+复制 `.env.example` 中的变量到自己的安全环境配置，至少显式设置：
+
+```text
+DEEPSEEK_API_KEY
+DEEPSEEK_MODEL
+```
+
+项目不会自动读取或提交真实密钥，也不会在失败时静默回退 Mock。单意图CLI：
+
+```powershell
+python -m src.tools.demo_intent --live --reference-date 2026-11-13
+python -m src.tools.demo_intent --live --execute --explain --reference-date 2026-11-13
+```
+
+多工具 Agent 通过 Python 接口启动：
 
 ```python
-from src.analytics.feedback import analyze_feedback_trends
+from src.agent.agent_controller import AgentController
+from src.agent.intent.deepseek_provider import DeepSeekProvider
 
-result = analyze_feedback_trends(
-    "2026-08-16", "2026-11-13",
-    breakdown_by="channel",
-    analysis_mode="rules",
+agent = AgentController(DeepSeekProvider(), explain_results=True)
+result = agent.run(
+    "先分析最近7天的用户活跃情况，再分析上个月注册用户的留存情况，最后综合分析这两个结果。",
+    reference_date="2026-11-13",
 )
+print(result["status"], result["observations"], result["combined_explanation"])
 ```
 
-结果包含总量、独立反馈用户数、原文种类、每日数量、主题/情感及状态分布、每日负面数量及占比、前10种高频原文和可选分组。相同文本的不同反馈记录分别计数，用户数按user_id去重，原始文本不做清洗改写。
+这段代码会在模型选择 `call_tool` 后访问本地只读数据库。模型只生成动作和报告草稿，不能直接生成或执行 SQL。
 
-分组白名单为 `channel`（反馈提交渠道）、`acquisition_channel`（用户获客渠道）、`plan_type`（当前套餐快照，不能还原提交时的历史套餐）。缺少关联用户时保留反馈，用户属性分组值为null并返回警告。
+## 10. 测试结果与真实联调情况
 
-`analysis_mode="none"` 不调用分类器，仅返回原始统计；主题、情感、状态分布、负面趋势和分类计数为None，不能解读为没有负面反馈。`rules`模式单独保留unknown和invalid_input，不将unknown并入neutral。`summary.unknown_category/unknown_sentiment`包括invalid_input带来的unknown标签，`valid_unknown_*`则排除无效输入；两种统计不混淆。
+当前核心版本的完整离线回归结果：
 
-日期按UTC，起止日期包含当天，SQL采用 `[开始日零点, 结束日次日零点)`；默认覆盖来自配置的2026-08-16至2026-11-13。可用 `data_start_date` 和 `data_through_date` 显式声明其他数据覆盖范围，覆盖外请求报错。配置或调用者声明不能证明内部采集无中断。
-
-比例使用0～1小数并保留4位；主题/情感分母为范围内所有反馈（包括unknown与invalid_input），每日负面比例分母为当天所有反馈，分组比例分母为组内反馈。完整覆盖且无反馈的日期数量和负面比例均为0。分类器异常将抛出带反馈ID的FeedbackAnalysisError，不生成成功的部分报告。
-
-默认每页100条，通过唯一feedback_id的游标分页，核对COUNT、ID唯一性、独立用户数、不同文本数及每页truncated。截断、重复ID、缺页或计数变化会报错。SQLQueryTool的各次查询是独立连接，不保证并发修改时的跨页事务快照；正式只读模拟库可正常使用。
-
-演示命令（无参数默认读取配置完整时间范围）：
-
-```powershell
-python -m src.tools.demo_feedback_trends
-python -m src.tools.demo_feedback_trends 2026-11-01 2026-11-13 --breakdown-by acquisition_channel
-python -m src.tools.demo_feedback_trends 2026-08-16 2026-11-13 --breakdown-by plan_type
-python -m src.tools.demo_feedback_trends 2026-08-16 2026-11-13 --analysis-mode none
-python -m unittest discover -s tests -p "test_feedback_trends.py" -v
+```text
+420 passed, 303 subtests passed
 ```
 
-正式库验证（2026-08-16至2026-11-13）：186条反馈、186位用户、15种文本，负面85、正面52、中性49，unknown与invalid_input均0，歧义标记81。反馈趋势测试29项通过。规则基于少量模板，结果表示文本规则分类，不是独立样本准确率或满意度评分。
+测试包含临时SQLite、Mock/Fake Provider、Fake SDK客户端、四个业务工具、Registry/Executor、IntentPipeline、澄清恢复、多工具循环、证据路径和语义校验；默认测试不发送真实DeepSeek请求。
 
-## 单 Agent 工具注册与统一调用
+项目进行过显式 DeepSeek Live 联调，用于验证Provider、动作生成、日期参数和报告链路。联调曾发现并修复相对日期占位符冲突、`remaining_tasks`改写缺少原文证据、完成状态误判和报告语义模板问题。最新多工具完整链路由离线端到端测试稳定覆盖；这里不把 Fake 结果宣传为真实模型结果，也不宣称每次Live运行都能稳定完成。
 
-`src/agent/` 提供 Tool Registry、JSON-Schema 风格参数定义、Tool Executor 和稳定结果格式。Registry 仅保存明确注册的四个业务函数，不根据用户输入动态导入或执行 Python 代码；Executor 先验证结构化参数，再调用已注册函数。四个工具均为只读分析工具，Agent Schema 不开放内部 `db_path` 和 `query_runner` 参数。
+正式合成数据库曾只读验证：`users=1000`、`devices=794`、`events=30852`、`feedback=186`、`payments=89`。这些数字只描述项目参考数据集，不代表真实业务。
 
-```python
-from src.agent import ToolExecutor, create_default_tool_registry
+## 11. 项目目录结构
 
-registry = create_default_tool_registry()
-print(registry.get_tool_descriptions())
-
-executor = ToolExecutor(registry)
-result = executor.execute(
-    "analyze_user_activity",
-    {"start_date": "2026-11-01", "end_date": "2026-11-13"},
-)
+```text
+family-ai-growth-agent-1/
+├── configs/                  # 数据截止日期和路径配置
+├── data/                     # 本地合成CSV、SQLite、离线ground_truth（Git忽略）
+├── database/schema.sql       # SQLite表结构
+├── docs/                     # 架构、Agent循环、工具系统和业务规则文档
+├── scripts/run_phase1.py     # 合成数据流水线
+├── src/
+│   ├── agent/                # AgentController、Provider、日期、校验、执行与报告
+│   ├── analytics/            # 四个业务分析工具
+│   ├── data/                 # 数据生成、校验、导入和反馈规则分类器
+│   └── tools/                # SQL工具及命令行演示
+├── tests/                    # 单元、集成和离线端到端测试
+├── AGENTS.md
+├── DEVELOPMENT_LOG.md
+└── requirements.txt
 ```
 
-成功和失败均返回包含 `ok`、`tool_name`、`data`、`error`、`metadata.execution_status` 的统一结构。参数缺失、类型或日期错误、多余字段、非法枚举都会在执行前失败，业务函数不会被调用。完整设计、错误代码、四个 Schema 及新增第五个工具的方法见 `docs/agent_tool_system.md`。
+## 12. 当前限制
 
-专项测试：
-
-```powershell
-python -m unittest discover -s tests -p "test_tool_registry.py" -v
-python -m unittest discover -s tests -p "test_tool_executor.py" -v
-python -m unittest discover -s tests -p "test_result_formatter.py" -v
-```
-
-## 单 Agent 基础执行循环（阶段4.5.1）
-
-`src/agent/agent_controller.py` 新增 `AgentController`：每轮由模型根据原始任务、当前工具说明和真实观察选择调用一个工具、请求澄清或结束。允许连续调用不同工具，不写死业务工具顺序。
-
-执行前复用Registry白名单与现有Tool Schema，经ToolExecutor调用只读工具；默认最多4次调用，失败即停止并保留错误。返回真实观察，可显式启用ResultExplainer逐工具解释；尚无跨工具综合报告。
-
-`src/agent/action_provider.py` 提供离线Mock接口，DeepSeekProvider新增独立的`generate_action()`并复用安全传输。未新增自动Live或正式数据库调用入口。使用方法和离线双工具示例见[基础循环说明](docs/basic_agent_loop.md)。
-
-阶段4.5.2增加每轮原文及任务上下文保留、日期和参数检查轨迹。`run(user_input, reference_date=None)`复用DateResolver处理相对日期及ISO范围，参考日优先显式值，其次配置数据截止日期。日期字段按工具映射并核对真实Schema，模型日期与本地结果冲突时停止澄清，不静默覆盖。尚未实现澄清恢复或多工具综合报告。
-
-```powershell
-python -m unittest discover -s tests -p "test_agent_controller.py" -v
-python -m unittest discover -s tests -p "test_agent_context.py" -v
-```
-
-## 后续阶段规划
-
-- 第二阶段：LangGraph 单 Agent，自主规划、工具选择、执行反馈与动态重规划。
-- 第三阶段：SQL 查询、Python 指标分析、反馈分类等工具。
-- 第四阶段：Streamlit 运营助手与可视化看板。
-- 第五阶段：业务案例测试、结果评估、GitHub 文档和简历整理。
+- Agent只有单次进程内上下文，没有跨会话长期记忆或任务持久化。
+- 最多支持两轮澄清，工具调用次数有明确上限；没有复杂反思或开放式重规划。
+- 当前仅有四个预定义只读业务工具，不能执行任意SQL、Python或外部系统操作。
+- 相对日期仅支持项目登记的表达；复杂自然语言日期需要澄清。
+- 多工具报告只允许受支持的观测和保守并列描述，不自动推导相关性或因果关系。
+- DeepSeek输出仍可能因格式、证据或语义不合规被本地校验拒绝；这是安全设计，不是自动修复机制。
+- 数据为有限规模的合成数据，默认覆盖到 `2026-11-13`；套餐为当前快照。
+- 项目未部署公网，也没有Web UI、用户权限、监控、异步任务或生产级高可用设计。
