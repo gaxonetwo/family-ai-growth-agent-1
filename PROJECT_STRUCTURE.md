@@ -18,8 +18,6 @@ family-ai-growth-agent-1/
 ├── data/
 ├── database/
 ├── docs/
-├── reports/
-└── README.md
 ├── scripts/
 ├── src/
 └── tests/
@@ -121,7 +119,6 @@ src/
 │   ├── demo_sql_queries.py
 │   ├── demo_user_activity.py
 │   └── sql_query_tool.py
-└── ui/
 \`\`\`
 
 ### 4.1 \`src/agent/\`：Agent控制与报告层
@@ -180,10 +177,6 @@ src/
 - \`demo_*.py\`：分别演示业务分析、SQL查询和单意图处理入口。
 
 该目录不存放四个核心业务指标函数；业务指标实现位于 \`src/analytics/\`。
-
-### 4.6 \`src/ui/\`：界面预留目录
-
-当前GitHub中该目录只有 \`__init__.py\`，尚无已交付的Web或Streamlit界面。不要把目录存在描述成网站已经实现。
 
 ## 5. 测试目录
 
