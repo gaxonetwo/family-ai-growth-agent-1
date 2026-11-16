@@ -220,7 +220,6 @@ family-ai-growth-agent-1/
 ├── database/
 │   └── schema.sql                    # SQLite表结构和索引定义
 ├── docs/                             # 架构、Agent循环、工具系统和业务规则
-├── reports/                          # 分析报告输出位置
 ├── scripts/
 │   └── run_phase1.py                 # 合成数据生成、校验和导入流水线
 ├── src/
@@ -230,7 +229,6 @@ family-ai-growth-agent-1/
 │   ├── data/                         # 数据生成、质量检查、导入和反馈分类
 │   │   └── feedback_classifier/      # 反馈文本标准化、主题和情感规则分类
 │   ├── tools/                        # SQL只读查询工具及命令行演示入口
-│   └── ui/                           # 界面模块预留位置，当前尚未实现可用界面
 ├── tests/                            # 单元、集成和离线端到端测试
 ├── AGENTS.md                         # Codex开发规范
 ├── DEVELOPMENT_LOG.md                # 项目阶段记录
@@ -247,7 +245,7 @@ family-ai-growth-agent-1/
 - \`tests/\`：覆盖业务工具、意图识别、工具安全、Agent状态和多工具报告。
 - \`docs/\`：记录系统架构、Agent执行循环、工具系统和业务分类规则。
 
-仓库中的 \`data/raw/\`、\`data/processed/\`、\`data/ground_truth/\` 和 \`reports/\` 当前保留目录占位文件；本地运行数据可能被Git忽略，不会全部显示在GitHub上。完整目录说明见 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。
+仓库中的 \`data/raw/\`、\`data/processed/\` 和 \`data/ground_truth/\` 当前保留目录占位文件；本地运行数据可能被Git忽略，不会全部显示在GitHub上。完整目录说明见 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。
 
 ## 12. 当前限制
 
