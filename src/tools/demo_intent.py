@@ -14,6 +14,7 @@ from src.agent.intent.models import IntentCandidate, IntentStatus, ProviderRespo
 from src.agent.intent.provider import IntentProviderError
 from src.agent.single_tool_execution import SingleToolExecution
 from src.agent.tool_executor import ToolExecutor
+from src.agent.result_explainer import ResultExplainer
 
 
 _PROVIDER_ERROR_MESSAGES = {
@@ -113,12 +114,15 @@ def run_session(pipeline, *, input_fn=None, output_fn=None, reference_date=None)
 def main(argv=None):
     parser = argparse.ArgumentParser(description="意图识别演示：--live使用DeepSeek，--execute显式执行单个只读工具")
     parser.add_argument("--execute", action="store_true", help="仅对最终验证通过的任务执行一次业务工具")
+    parser.add_argument("--explain", action="store_true", help="执行成功后解释结果；真实解释还需--live")
     parser.add_argument("--live", action="store_true", help="显式启用DeepSeek；输入有效业务问题后才发送请求")
     parser.add_argument("--intent", choices=[i.value for i in IntentCandidate], default="activity_analysis")
     parser.add_argument("--scenario", choices=["ready", "clarification", "unresolved"], default="ready")
     parser.add_argument("--reference-date", help="可选参考日期 YYYY-MM-DD；默认读取项目配置")
     parser.add_argument("--confidence-threshold", help="覆盖 INTENT_CONFIDENCE_THRESHOLD")
     args = parser.parse_args(argv)
+    if args.explain and not args.execute:
+        parser.error("--explain需要同时指定--execute")
     if args.live:
         print("Live模式：有效输入将发送给DeepSeek识别意图；--intent和--scenario不生效。")
     else:
@@ -142,6 +146,13 @@ def main(argv=None):
                 print("未执行原因：" + execution["error"]["message"])
             if not execution["ok"]:
                 return 1
+            if args.explain:
+                if not args.live:
+                    print("Mock模式未生成真实模型报告；原始业务结果已保留。真实解释需--live。")
+                else:
+                    explanation = ResultExplainer(provider).explain(
+                        current.user_input, execution["tool_result"]["tool_name"], execution["tool_result"])
+                    print("结果解释（与工具执行状态独立）：" + json.dumps(explanation, ensure_ascii=False, indent=2))
     except IntentProviderError as exc:
         display_provider_error(exc)
         return 2
