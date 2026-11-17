@@ -7,3 +7,5 @@ data/raw/*.csv
 data/ground_truth/*.csv
 reports/*
 !.gitkeep
+eval/results/
+eval/results.json

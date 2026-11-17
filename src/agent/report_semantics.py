@@ -106,18 +106,50 @@ def multi_report_context(tool_results):
 
 
 class SemanticReportError(ValueError):
-    """Stable local rejection reason, never contains model or user prose."""
+    """Stable code plus structured diagnostic data (sanitized by the caller)."""
+
+    def __init__(self, code, *, field=None, actual=None, expected=None, reason=None):
+        super().__init__(code)
+        self.details = dict(field=field, actual=actual, expected=expected,
+                            reason=reason or code)
+
+
+def _semantic_diagnostic(code, report, context, finding=None, index=None):
+    """Keep the existing rejection code, attach the relevant protocol inputs."""
+    fields = {
+        'unverified_summary': 'summary', 'missing_summary_evidence': 'summary_finding_indices',
+        'summary_evidence_mismatch': 'summary_evidence',
+        'unverified_suggestion': 'suggestions', 'suggestion_missing_evidence': 'suggestions',
+        'methodology_limits_missing_or_changed': 'limitations',
+    }
+    key = fields.get(code)
+    if key:
+        expected = ('\n'.join(report['key_findings'][i]['description']
+                              for i in report.get('summary_finding_indices', []))
+                    if key == 'summary' else context.get('required_limitations')
+                    if key == 'limitations' else context.get('allowed_suggestions')
+                    if key == 'suggestions' else 'valid ordered finding references and matching evidence')
+        return SemanticReportError(code, field='/'+key, actual=report.get(key),
+            expected=expected, reason='报告字段不符合受限语义协议')
+    return SemanticReportError(code,
+        field=f'/key_findings/{index}' if index is not None else '/',
+        actual=finding if finding is not None else report,
+        expected={'metric_catalog': context['metric_catalog'],
+                  'protocol': code}, reason='字段、声明或指标定义不符合受限协议')
 
 
 def validate_semantics(report, data, context, resolve_path):
     """Exact templates deliberately reject unrecognized semantic assertions."""
     def reject(code):
-        raise SemanticReportError(code)
+        raise _semantic_diagnostic(code, report, context, current[0], current[1])
+
+    current = [None, None]
 
     if set(report) != {"status", "summary", "summary_finding_indices", "summary_evidence", "key_findings", "limitations", "suggestions"}:
         reject("invalid_semantic_report_fields")
     descriptions = []
-    for finding in report["key_findings"]:
+    for finding_index, finding in enumerate(report["key_findings"]):
+        current[:] = [finding, finding_index]
         claim = finding.get("claim")
         if not isinstance(claim, dict):
             reject("unsupported_semantic_claim")
@@ -156,9 +188,15 @@ def validate_semantics(report, data, context, resolve_path):
         else:
             reject("unsupported_semantic_claim")
         if finding["description"] != expected or finding["title"] != title:
-            reject("unverified_semantic_statement")
+            field = 'description' if finding['description'] != expected else 'title'
+            raise SemanticReportError('unverified_semantic_statement',
+                field=f'/key_findings/{finding_index}/{field}', actual=finding[field],
+                expected=expected if field == 'description' else title,
+                reason='发现文本必须严格匹配已验证声明的模板')
         if evidence != expected_evidence:
-            reject("claim_evidence_mismatch")
+            raise SemanticReportError('claim_evidence_mismatch',
+                field=f'/key_findings/{finding_index}/evidence', actual=evidence,
+                expected=expected_evidence, reason='证据列表与声明的路径、值或顺序不一致')
         descriptions.append(expected)
     # Summary is a traceable subset of verified findings, never a second channel
     # for unconstrained business claims. CLI keeps its original summary string.
@@ -179,7 +217,9 @@ def validate_semantics(report, data, context, resolve_path):
 def validate_multi_semantics(report, data, context, resolve_path):
     """Validate observed and cross-tool claims without inferring relationships."""
     def reject(code):
-        raise SemanticReportError(code)
+        raise _semantic_diagnostic(code, report, context, current[0], current[1])
+
+    current = [None, None]
 
     expected_fields = {"status", "summary", "summary_finding_indices",
                        "summary_evidence", "key_findings", "limitations",
@@ -187,7 +227,8 @@ def validate_multi_semantics(report, data, context, resolve_path):
     if set(report) != expected_fields:
         reject("invalid_semantic_report_fields")
     descriptions = []
-    for finding in report["key_findings"]:
+    for finding_index, finding in enumerate(report["key_findings"]):
+        current[:] = [finding, finding_index]
         if set(finding) != {"title", "description", "claim", "evidence"}:
             reject("invalid_semantic_finding_fields")
         claim = finding.get("claim")
@@ -232,9 +273,15 @@ def validate_multi_semantics(report, data, context, resolve_path):
         else:
             reject("unsupported_semantic_claim")
         if finding["title"] != title or finding["description"] != description:
-            reject("unverified_semantic_statement")
+            field = 'description' if finding['description'] != description else 'title'
+            raise SemanticReportError('unverified_semantic_statement',
+                field=f'/key_findings/{finding_index}/{field}', actual=finding[field],
+                expected=description if field == 'description' else title,
+                reason='发现文本必须严格匹配已验证声明的模板')
         if finding["evidence"] != evidence:
-            reject("claim_evidence_mismatch")
+            raise SemanticReportError('claim_evidence_mismatch',
+                field=f'/key_findings/{finding_index}/evidence', actual=finding['evidence'],
+                expected=evidence, reason='证据列表与声明的路径、值或顺序不一致')
         descriptions.append(description)
 
     indices = report.get("summary_finding_indices")

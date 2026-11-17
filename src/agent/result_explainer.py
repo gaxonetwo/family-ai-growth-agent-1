@@ -2,6 +2,27 @@
 from copy import deepcopy
 import json
 import re
+from src.agent.tracing import _safe
+
+
+def _diagnostic_snapshot(value, budget=8000):
+    """Bound the whole JSON snapshot while retaining a structured container."""
+    try:
+        safe = _safe(value)
+        encoded = json.dumps(safe, ensure_ascii=False, allow_nan=False)
+        if len(encoded) <= budget:
+            return safe
+        return {'truncated': True, 'preview': encoded[:max(0, (budget-200)//8)],
+                'original_characters': len(encoded)}
+    except (ValueError, TypeError, RecursionError):
+        return {'unavailable': True, 'reason': 'not_json_serializable'}
+
+
+def _failed_report(code, response=None, details=None):
+    return dict(status='failed', report=None, error=dict(code=code,
+                details=_diagnostic_snapshot(details or dict(reason=code))),
+                failed_report=_diagnostic_snapshot(response.get('output')) if isinstance(response, dict) else None,
+                model=_diagnostic_snapshot(response.get('model'), 500) if isinstance(response, dict) else None)
 
 from src.agent.intent.provider import IntentProviderError
 from src.agent.report_semantics import (
@@ -102,7 +123,7 @@ class ResultExplainer:
     def explain(self, user_question, tool_name, tool_result):
         """tool_result is the complete ToolExecutor envelope, not arbitrary data."""
         def failure(code):
-            return dict(status="failed", report=None, error={"code": code}, model=None)
+            return _failed_report(code)
         if not isinstance(user_question, str) or not user_question.strip():
             return failure("invalid_question")
         if (not isinstance(tool_result, dict) or tool_result.get("ok") is not True
@@ -131,7 +152,7 @@ class ResultExplainer:
         if not isinstance(response, dict):
             return failure("invalid_report_structure")
         if response.get("finish_reason") == "length":
-            return failure("response_truncated")
+            return _failed_report("response_truncated", response)
         if not isinstance(response.get("model"), str) or not response["model"] or response.get("finish_reason") != "stop":
             return failure("invalid_response_metadata")
         report = response.get("output")
@@ -139,15 +160,17 @@ class ResultExplainer:
             _validate_report(report, data)
             validate_semantics(report, data, context, resolve_path)
         except SemanticReportError as exc:
-            return failure(str(exc))
-        except (ValueError, TypeError, KeyError, IndexError):
-            return failure("invalid_report_or_evidence")
+            return _failed_report(str(exc), response, exc.details)
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            return _failed_report('report_validation_exception', response,
+                dict(field='/', actual=None, expected='valid report',
+                     reason=type(exc).__name__))
         return dict(status="success", report=deepcopy(report), error=None, model=response.get("model"))
 
     def explain_multiple(self, user_question, observations):
         """Create one evidence-checked report from at least two distinct tools."""
         def failure(code):
-            return dict(status="failed", report=None, error={"code": code}, model=None)
+            return _failed_report(code)
 
         if not isinstance(user_question, str) or not user_question.strip():
             return failure("invalid_question")
@@ -204,7 +227,7 @@ class ResultExplainer:
         if not isinstance(response, dict):
             return failure("invalid_report_structure")
         if response.get("finish_reason") == "length":
-            return failure("response_truncated")
+            return _failed_report("response_truncated", response)
         if (not isinstance(response.get("model"), str) or not response["model"] or
                 response.get("finish_reason") != "stop"):
             return failure("invalid_response_metadata")
@@ -213,42 +236,82 @@ class ResultExplainer:
             _validate_multi_report(report, aggregate)
             validate_multi_semantics(report, aggregate, context, resolve_path)
         except SemanticReportError as exc:
-            return failure(str(exc))
-        except (ValueError, TypeError, KeyError, IndexError):
-            return failure("invalid_report_or_evidence")
+            return _failed_report(str(exc), response, exc.details)
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            return _failed_report('report_validation_exception', response,
+                dict(field='/', actual=None, expected='valid report', reason=type(exc).__name__))
         return dict(status="success", report=deepcopy(report), error=None,
                     model=response.get("model"))
 
 
 def _validate_report(report, data):
-    if not isinstance(report, dict) or report.get("status") != "success":
-        raise ValueError("invalid_report")
-    if not isinstance(report.get("summary"), str) or not report["summary"].strip():
-        raise ValueError("invalid_summary")
-    for field in ("limitations", "suggestions"):
-        if not isinstance(report.get(field), list) or any(not isinstance(v, str) for v in report[field]):
-            raise ValueError("invalid_report_list")
-    findings = report.get("key_findings")
-    if not isinstance(findings, list) or not findings:
-        raise ValueError("missing_findings")
-    for finding in findings:
-        if not isinstance(finding, dict) or any(not isinstance(finding.get(k), str) or not finding[k].strip() for k in ("title", "description")):
-            raise ValueError("invalid_finding")
-        evidence = finding.get("evidence")
-        if not isinstance(evidence, list) or not evidence:
-            raise ValueError("missing_evidence")
-        for item in evidence:
-            if not isinstance(item, dict) or "value" not in item:
-                raise ValueError("invalid_evidence")
-            actual = resolve_path(data, item["json_path"])
+    _require(report, '/', dict)
+    for name, kind in (('status', str), ('summary', str), ('limitations', list),
+                       ('suggestions', list), ('key_findings', list)):
+        _field(report, name, '/', kind)
+    _equals(report['status'], 'success', '/status')
+    _nonempty(report['summary'], '/summary')
+    for field in ('limitations', 'suggestions'):
+        for index, value in enumerate(report[field]):
+            _require(value, f'/{field}/{index}', str)
+    _nonempty(report['key_findings'], '/key_findings')
+    for index, finding in enumerate(report['key_findings']):
+        base = f'/key_findings/{index}'
+        _require(finding, base, dict)
+        for field in ('title', 'description'):
+            _field(finding, field, base, str)
+            _nonempty(finding[field], base+'/'+field)
+        _field(finding, 'evidence', base, list)
+        _nonempty(finding['evidence'], base+'/evidence')
+        for evidence_index, item in enumerate(finding['evidence']):
+            location = f'{base}/evidence/{evidence_index}'
+            _require(item, location, dict)
+            _field(item, 'json_path', location, str)
+            if 'value' not in item:
+                raise SemanticReportError('report_field_missing', field=location+'/value',
+                    expected='original JSON value', reason='证据缺少value字段')
+            try:
+                actual = resolve_path(data, item['json_path'])
+            except (ValueError, TypeError, KeyError, IndexError):
+                raise SemanticReportError('evidence_path_error', field=location+'/json_path',
+                    actual=item['json_path'], expected='existing business data path',
+                    reason='证据路径格式无效或路径不存在') from None
             # Strict JSON equality distinguishes null, booleans, and numbers.
             if json.dumps(actual, sort_keys=True, allow_nan=False) != json.dumps(item["value"], sort_keys=True, allow_nan=False):
-                raise ValueError("evidence_mismatch")
+                raise SemanticReportError('evidence_value_mismatch', field=location+'/value',
+                    actual=item['value'], expected=actual, reason='证据值与原始业务值不一致')
+
+
+def _require(value, field, kind):
+    if not isinstance(value, kind):
+        raise SemanticReportError('report_type_error', field=field, actual=value,
+            expected=kind.__name__, reason='字段类型错误')
+
+
+def _field(obj, key, base, kind):
+    location = base.rstrip('/')+'/'+key
+    if key not in obj:
+        raise SemanticReportError('report_field_missing', field=location,
+            expected=kind.__name__, reason='缺少必需字段')
+    _require(obj[key], location, kind)
+
+
+def _nonempty(value, field):
+    if not value or isinstance(value, str) and not value.strip():
+        raise SemanticReportError('report_empty_field', field=field, actual=value,
+            expected='nonempty value', reason='字段不可为空')
+
+
+def _equals(actual, expected, field):
+    if actual != expected:
+        raise SemanticReportError('report_value_error', field=field, actual=actual,
+            expected=expected, reason='字段值不符合协议')
 
 
 def _validate_multi_report(report, data):
     def reject(code):
-        raise SemanticReportError(code)
+        raise SemanticReportError(code, field='/', actual=report,
+            expected='valid multi-tool report structure', reason=code)
 
     if not isinstance(report, dict) or report.get("status") != "success":
         reject("invalid_multi_report")
@@ -264,7 +327,7 @@ def _validate_multi_report(report, data):
     findings = report.get("key_findings")
     if not isinstance(findings, list) or not findings:
         reject("missing_multi_findings")
-    for finding in findings:
+    for finding_index, finding in enumerate(findings):
         if (not isinstance(finding, dict) or
                 any(not isinstance(finding.get(key), str) or not finding[key].strip()
                     for key in ("title", "description"))):
@@ -272,13 +335,17 @@ def _validate_multi_report(report, data):
         evidence = finding.get("evidence")
         if not isinstance(evidence, list) or not evidence:
             reject("missing_multi_evidence")
-        for item in evidence:
+        for evidence_index, item in enumerate(evidence):
+            location = f'/key_findings/{finding_index}/evidence/{evidence_index}'
             if not isinstance(item, dict) or set(item) != {"json_path", "value"}:
                 reject("invalid_multi_evidence")
             try:
                 actual = resolve_path(data, item["json_path"])
             except (ValueError, TypeError, KeyError, IndexError):
-                reject("multi_evidence_path_not_found")
+                raise SemanticReportError('multi_evidence_path_not_found',
+                    field=location+'/json_path', actual=item['json_path'],
+                    expected='existing business data path', reason='证据路径不存在或格式无效') from None
             if (json.dumps(actual, sort_keys=True, allow_nan=False) !=
                     json.dumps(item["value"], sort_keys=True, allow_nan=False)):
-                reject("multi_evidence_mismatch")
+                raise SemanticReportError('multi_evidence_mismatch', field=location+'/value',
+                    actual=item['value'], expected=actual, reason='证据值不等于原始工具值')

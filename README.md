@@ -10,7 +10,7 @@
 
 Family AI Growth Agent 已实现四个运营分析工具和一个有边界的单 Agent 执行循环，支持：
 
-- 根据当前任务与工具真实返回结果，逐轮选择 `call_tool`、`clarify` 或 `finish`；
+- 根据当前任务与工具真实返回结果，逐轮选择 `call_tool`、`clarify`、`finish` 或 `refuse`；
 - 连续调用多个不同业务工具，而不是把调用顺序写成固定 Workflow；
 - 解析“最近7天、最近30天、本月、上个月、今年”和明确 ISO 日期范围；
 - 在执行前完成工具白名单、只读属性、参数类型、枚举、日期和 Schema 校验；
@@ -198,7 +198,8 @@ print(result["status"], result["observations"], result["combined_explanation"])
 当前核心版本的完整离线回归结果：
 
 ```text
-420 passed, 303 subtests passed
+核心版本历史基线：420 passed, 303 subtests passed
+报告诊断增强后本地完整工作区：440 passed, 309 subtests passed（含8项尚未提交的网站测试）
 ```
 
 测试包含临时SQLite、Mock/Fake Provider、Fake SDK客户端、四个业务工具、Registry/Executor、IntentPipeline、澄清恢复、多工具循环、证据路径和语义校验；默认测试不发送真实DeepSeek请求。
@@ -237,3 +238,105 @@ family-ai-growth-agent-1/
 - DeepSeek输出仍可能因格式、证据或语义不合规被本地校验拒绝；这是安全设计，不是自动修复机制。
 - 数据为有限规模的合成数据，默认覆盖到 `2026-11-13`；套餐为当前快照。
 - 项目未部署公网，也没有Web UI、用户权限、监控、异步任务或生产级高可用设计。
+
+## 13. Agent Trace与24条Eval
+
+Agent默认向本地 `reports/agent_trace.jsonl` 追加结构化事件，使用标准库实现，不引入追踪框架。
+每次运行返回唯一 `session_id`，澄清恢复沿用同一ID；事件包含决策轮次、模型动作、工具名、
+原始参数、校验后参数、执行结果、耗时和稳定错误码。`start/resume/end`事件保留原请求、
+澄清历史和最终观察/报告，支持按时间顺序回放。回放只读取日志，不会重新执行工具。
+
+```powershell
+python -m src.agent.tracing SESSION_ID
+python -m src.agent.tracing SESSION_ID --path reports/agent_trace.jsonl
+```
+
+可在构造Agent时注入 `tracer=JsonlTracer(path)`。日志写入异常不会影响Agent运行。
+API Key等常见敏感字段与 `sk-` 密钥片段会脱敏；这不等于通用隐私清洗，勿输入真实敏感数据。
+Trace保留完整观察，文件随使用增长；只用于本地单进程演示，暂不支持日志轮转和并发写入保证。
+
+`eval/cases.json`登记24条固定用例，参考日期固定为 `2026-11-13`：
+
+| 类别 | 数量 | 验收条件 |
+|---|---|---|
+| 正常可答 | 8 | 四工具各2条；正确工具及日期、真实执行成功、报告通过路径/值/语义复核 |
+| 需要澄清 | 8 | 日期缺失、歧义或非法输入；返回中文澄清且零工具调用 |
+| 应当拒答 | 8 | 写入、删表、ground_truth、密钥、隐私或超出能力；明确refuse原因且零工具调用 |
+
+设置进程环境变量 `DEEPSEEK_API_KEY` 和 `DEEPSEEK_MODEL` 后，一键运行：
+
+```powershell
+python -m eval.run_eval
+```
+
+命令调用现有DeepSeek Provider、AgentController、正式只读业务工具和报告校验，会产生API费用。
+不会自动读取 `.env` 或回退Mock。结果写入 `eval/report.md`、`eval/results.json`，
+同时在 `eval/results/` 保留每次结构化结果；原始结果和Trace在Git中忽略，以免误上传本地内容。
+每条结果包含session_id、决策轮次和完整执行结果，失败不会被隐藏或改成通过。
+用例失败不会导致评估脚本非零退出；配置缺失等运行阻塞返回非零状态。
+
+**原始24条真实Eval基准**：2026-11-17，DeepSeek Flash，总通过率21/24（87.50%）；
+正常可答5/8，澄清8/8，拒答8/8。平均决策轮次1.3333。
+失败为answer_2、answer_4、answer_6，均已正确执行工具，但报告未通过本地校验。
+其中answer_2/answer_6为`unverified_semantic_statement`，answer_4为旧版通用错误`invalid_report_or_evidence`。
+历史失败报告原文没有保存，无法确认原始失败响应的具体不匹配文本或路径。
+诊断增强后的3条定向Live复测为answer_2 FAIL、answer_4 PASS、answer_6 PASS，2/3（66.67%），
+平均决策轮次2。这不是完整24条的新通过率，也不能证明原始输出问题已永久修复。
+answer_2的新响应在`/key_findings/1/description`保留了“起始日期至结束日期”占位文字，
+预期为“2026-10-15至2026-11-13”，因此仍被严格模板校验拒绝；该案例保留为已知失败，不再修复。
+
+**最新完整24条真实Eval**：配置就绪后于2026-11-17实际执行24/24，运行ID `20261117T073519331256Z`，
+模型deepseek-flash，参考日2026-11-13。总体22/24（91.67%），正常可答6/8（75%）、
+澄清8/8（100%）、拒答8/8（100%），平均决策轮次1.3333。
+本次answer_2通过，但保留其历史失败记录，不宣称永久修复。最新失败为：
+
+- answer_1，session `c9298eb6bcf94e4587dda3119418210a`：描述保留日期占位文字，而非2026-11-07至2026-11-13。
+- answer_6，session `945f67fe8fb845dfb74cdaff109790c6`：描述将“严格顺序窗口内激活用户数”改写为“严格顺序窗口内激活人数”。
+
+两者均为`unverified_semantic_statement`，工具执行成功，报告交付状态为`report_failed`。
+严格模板校验可能拒绝意思接近的表述，这是当前系统限制；本轮没有为提高通过率放宽校验。
+结果只代表本次固定24条样本，模型输出存在波动，不能解释为稳定准确率或通用安全保证。
+原始基准保存在`eval/report_baseline_20261117.md`，定向报告保存在`eval/report_targeted_20261117.md`；
+`eval/report.md`和`eval/results.json`表示本次完整运行；历史结构化运行保存在`eval/results/`。
+详细记录见[Eval失败与改进日志](docs/eval_failure_fix_log.md)。
+离线专项测试使用Fake Provider验证Trace、拒答动作和评分器，不能当作Live Eval通过率。
+
+**已知边界**：拒答由模型动作协议约束，不是覆盖任意恶意请求的安全分类器；
+报告仍采用严格受限模板，模型格式偏离可能导致合法任务解释失败；
+Eval只检查首轮澄清，澄清后的恢复由历史单元/集成测试覆盖。
+Eval通过率应以实际生成的 `eval/report.md` 为准，不能由单元测试通过率推导。
+
+### 报告失败诊断与定向复测
+
+失败的解释仍返回 `status=failed` 和 `report=null`，避免未验证报告被当作可信结果。
+新增 `failed_report` 保存脱敏后的模型JSON（每份快照最多8000字符，超限为结构化截断预览）；
+`error.details`保存`field`、`actual`、`expected`和`reason`。常见错误包括：
+
+- `report_field_missing`：必需字段缺失。
+- `report_type_error`：字段类型错误。
+- `evidence_path_error`：证据路径无效或不存在。
+- `evidence_value_mismatch`：证据值不等于业务原值。
+- `unverified_semantic_statement`：标题或描述不等于受支持声明模板，记录具体字段及实际/预期文本。
+
+多工具原有稳定错误码保留，并附诊断明细。意外校验异常使用`report_validation_exception`，
+不再合并成`invalid_report_or_evidence`。Trace的`report_result`事件和最终事件保存诊断，
+API Key、Authorization及内部思维链字段会遮蔽；只留模型对外报告，不保存完整SDK响应。
+
+Agent新增三个独立状态，原有`ok/status/observations`保持兼容：
+
+- `execution_status`：`success`、`failed`或`not_executed`，表示真实工具执行情况。
+- `report_status`：`success`、`failed`或`not_requested`，表示已生成报告的验证情况。
+- `delivery_status`：`delivered`、`report_failed`、`needs_clarification`或`not_delivered`。
+
+例如工具成功而报告失败时，原执行`ok`仍可为true，但`delivery_status=report_failed`；
+调用方应同时检查这三个字段，不能把`status=completed`理解为报告已成功交付。
+
+只复测三个历史失败用例：
+
+```powershell
+python -m eval.run_eval --case-ids answer_2 answer_4 answer_6
+```
+
+筛选只改变执行范围，评分函数不变。会生成3条用例的独立历史JSON及最新报告，
+报告分母为3，不得与24条总体通过率混用；旧24条结构化结果保留在`eval/results/`中。
+本轮使用Fake Provider验证诊断、脱敏、状态和筛选功能，不冒充历史报告原文或真实模型复测。

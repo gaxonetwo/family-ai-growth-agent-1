@@ -200,7 +200,9 @@ class AgentControllerTests(unittest.TestCase):
         controller = AgentController(provider, self.registry)
         first = controller.run("同一任务")
         second = controller.run("同一任务")
-        self.assertEqual(first, second)
+        self.assertNotEqual(first['session_id'], second['session_id'])
+        self.assertEqual({k: v for k, v in first.items() if k != 'session_id'},
+                         {k: v for k, v in second.items() if k != 'session_id'})
         first["observations"][0]["result"]["data"]["users"] = 999
         self.assertEqual(second["observations"][0]["result"]["data"]["users"], 12)
 

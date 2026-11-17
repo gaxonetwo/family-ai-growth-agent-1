@@ -2,6 +2,9 @@
 from copy import deepcopy
 from datetime import date
 import json
+from time import perf_counter
+from uuid import uuid4
+from src.agent.tracing import JsonlTracer
 
 from src.agent.action_parameters import prepare_action_arguments
 from src.agent.intent.date_resolver import DateResolver
@@ -12,10 +15,11 @@ from src.agent.tool_registry import ToolNotFoundError, ToolRegistry, create_defa
 
 
 ACTION_PROMPT = """你是Family AI的单Agent。根据原始任务、当前工具描述和实际观察，决定下一步。
-每次只返回一个合法JSON动作，严格采用以下三种结构之一：
+每次只返回一个合法JSON动作，严格采用call_tool、clarify、finish、refuse四种结构之一：
 {"action":"call_tool","tool_name":"已注册工具名称","arguments":{}}
 {"action":"clarify","question":"针对缺失信息的中文问题"}
 {"action":"finish"}
+无法满足的越权、写入、ground_truth或工具能力以外请求，返回{"action":"refuse","reason":"具体中文原因"}，不得调用工具。
 工具顺序由任务和观察决定，不必调用所有工具。不调用工具也可以结束，但不能声称已取得数据。
 只能选择给定Registry的只读工具，参数必须满足真实Schema。不能生成SQL、Python或系统命令。
 保留工具指标和methodology，不能编造观察、改写数值、把失败当成功或将相关性当因果。
@@ -43,7 +47,8 @@ class AgentController:
     """
 
     def __init__(self, provider, registry=None, *, executor=None, max_tool_calls=4,
-                 max_context_chars=60000, explain_results=False, date_resolver=None):
+                 max_context_chars=60000, explain_results=False, date_resolver=None, tracer=None):
+        self.tracer = JsonlTracer() if tracer is None else tracer
         if not callable(getattr(provider, "generate_action", None)):
             raise TypeError("provider must implement generate_action.")
         if type(max_tool_calls) is not int or not 1 <= max_tool_calls <= 20:
@@ -74,6 +79,7 @@ class AgentController:
             pending_task_summaries=[], pending_source="original_request",
             clarification_history=[], reused_calls=[],
             combined_explanation=None, completion_verified=False,
+            session_id=uuid4().hex,
         )
         return self._run(user_input, reference_date, state)
 
@@ -94,6 +100,7 @@ class AgentController:
             return _continuation_error(previous_result, "invalid_clarification_answer")
 
         state = dict(
+            session_id=previous_result.get('session_id', uuid4().hex),
             observations=deepcopy(previous_result["observations"]),
             decisions=deepcopy(previous_result["decisions"]),
             explanations=deepcopy(previous_result["explanations"]),
@@ -119,6 +126,16 @@ class AgentController:
 
     def _run(self, user_input, reference_date, state):
         """Execute or resume the bounded loop from a defensive copy of state."""
+        session_id = state.get('session_id', uuid4().hex)
+        started = perf_counter()
+        def trace(event, **details):
+            try:
+                step = len(state['decisions']) + (1 if event == 'decision' else 0)
+                self.tracer.record(session_id, step, event, **details)
+            except Exception:
+                pass
+        trace('resume' if state['clarification_history'] else 'start',
+              user_input=user_input, clarification_history=state['clarification_history'])
         observations = deepcopy(state["observations"])
         decisions = deepcopy(state["decisions"])
         explanations = deepcopy(state["explanations"])
@@ -141,7 +158,27 @@ class AgentController:
         reused_this_run = set()
 
         def finish(status, *, code=None, question=None):
+            execution_status = ('failed' if any(o['result'].get('ok') is not True for o in observations)
+                                else 'success' if observations else 'not_executed')
+            report_results = [e['result'] for e in explanations]
+            if combined_explanation is not None:
+                report_results.append(combined_explanation)
+            report_status = ('failed' if any(r.get('status') != 'success' for r in report_results)
+                             else 'success' if report_results else 'not_requested')
+            delivery_status = ('report_failed' if report_status == 'failed' else
+                               'needs_clarification' if status == 'needs_clarification' else
+                               'delivered' if status == 'completed' and execution_status == 'success' else
+                               'not_delivered')
+            trace('end', status=status, error=code, clarification_question=question,
+                  execution_status=execution_status, report_status=report_status,
+                  delivery_status=delivery_status,
+                  elapsed_ms=round((perf_counter()-started)*1000, 3),
+                  observations=observations, explanations=explanations,
+                  combined_explanation=combined_explanation)
             return deepcopy(dict(
+                session_id=session_id,
+                execution_status=execution_status, report_status=report_status,
+                delivery_status=delivery_status,
                 ok=status == "completed", status=status, user_input=user_input,
                 reference_date=(reference_date.isoformat()
                                 if isinstance(reference_date, date) else reference_date),
@@ -190,6 +227,7 @@ class AgentController:
                 # Never silently cut off observations or send an unbounded prompt.
                 return finish("failed", code="context_too_large")
             try:
+                decision_started = perf_counter()
                 response = self.provider.generate_action(ACTION_PROMPT, context)
             except IntentProviderError as exc:
                 return finish("failed", code=exc.code)
@@ -203,9 +241,14 @@ class AgentController:
                     not isinstance(response.get("model"), str) or not response["model"]):
                 return finish("model_output_invalid", code="invalid_action_metadata")
             action = response.get("output")
+            trace('decision', model=response.get('model'), decision=action,
+                  elapsed_ms=round((perf_counter()-decision_started)*1000, 3))
             if not _valid_action(action):
                 return finish("model_output_invalid", code="invalid_action_structure")
             decisions.append(dict(action=deepcopy(action), model=response["model"]))
+            state['decisions'] = decisions
+            if action['action'] == 'refuse':
+                return finish('unsupported', code='request_refused', question=action['reason'])
             if "remaining_tasks" in action:
                 verified_tasks = []
                 task_summaries = []
@@ -241,6 +284,8 @@ class AgentController:
                         completion_verified):
                     combined_explanation = self.explainer.explain_multiple(
                         user_input, observations)
+                    trace('report_result', report_kind='combined',
+                          explanation=combined_explanation)
                 return finish("completed")
             if len(observations) >= self.max_tool_calls:
                 return finish("limit_reached", code="max_tool_calls_reached")
@@ -255,6 +300,8 @@ class AgentController:
                 evidence_input, reference_date=reference_date,
                 date_expression=action.get("date_expression"))
             parameter_checks.append(deepcopy(checked))
+            trace('validation', tool_name=name, original_arguments=action['arguments'],
+                  validated_arguments=checked['arguments'], validation=checked)
             if checked["status"] != "ready":
                 return finish("needs_clarification", code=checked["error"]["code"],
                               question=checked["clarification_question"])
@@ -272,7 +319,11 @@ class AgentController:
                 continue
             # The executor revalidates against the live registry, then invokes
             # the registered callable. No execution of model-provided code.
+            execution_started = perf_counter()
             result = self.executor.execute(name, deepcopy(arguments))
+            trace('tool_result', tool_name=name, original_arguments=action['arguments'],
+                  validated_arguments=arguments, result=result, error=result.get('error'),
+                  elapsed_ms=round((perf_counter()-execution_started)*1000, 3))
             observations.append(dict(
                 call_index=len(observations) + 1, tool_name=name,
                 arguments=deepcopy(arguments), result=deepcopy(result),
@@ -282,6 +333,8 @@ class AgentController:
             if self.explainer is not None:
                 explanations.append(dict(call_index=len(observations),
                     result=self.explainer.explain(user_input, name, result)))
+                trace('report_result', tool_name=name, call_index=len(observations),
+                      explanation=explanations[-1]['result'])
             # Only real execution envelopes feed the next decision, not reports.
 
 
@@ -356,6 +409,9 @@ def _valid_action(action):
     if not isinstance(action, dict):
         return False
     kind = action.get("action")
+    if kind == 'refuse':
+        return (set(action) == {'action', 'reason'} and
+                isinstance(action['reason'], str) and bool(action['reason'].strip()))
     optional = {"remaining_tasks"}
     if "remaining_tasks" in action:
         if not isinstance(action["remaining_tasks"], list):
